@@ -1,0 +1,25 @@
+[package]
+name = "radix-gate"
+version = "0.1.0"
+edition = "2024"
+authors = ["Prefix-Aware Systems"]
+description = "Deterministic Prefix-Aware KV-Cache Gateway and Radix Router for LLM Clusters"
+license = "Apache-2.0"
+
+[dependencies]
+tokio = { version = "1.40", features = ["full"] }
+axum = { version = "0.7", features = ["macros"] }
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.5", features = ["cors", "trace"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+clap = { version = "4.5", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+parking_lot = "0.12"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+futures-util = "0.3"
+comfy-table = "7.1"
+rand = "0.8"
+chrono = "0.4"
