@@ -1,5 +1,6 @@
 # ⚡ RadixGate: Prefix-Aware KV-Cache Gateway & Radix Router
 
+[![CI](https://github.com/SamGanYX/radix-gate/actions/workflows/ci.yml/badge.svg)](https://github.com/SamGanYX/radix-gate/actions)
 [![Rust](https://img.shields.io/badge/rust-1.80%2B-orange.svg)](https://www.rust-lang.org)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Target](https://img.shields.io/badge/target-Inference%20Infra%20%7C%20Anthropic%20%7C%20vLLM-purple.svg)]()
