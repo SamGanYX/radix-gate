@@ -1,11 +1,12 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::Instant;
 
 /// Type alias for 64-bit token block hash (e.g. 64 or 128 token window).
 pub type BlockHash = u64;
 
-/// Unique identifier for an inference worker replica.
-pub type WorkerId = String;
+/// Immutable shared string identifier for worker replicas to eliminate heap allocations in traversal.
+pub type WorkerId = Arc<str>;
 
 /// A node in the Radix Tree representing a sequence of token block hashes.
 #[derive(Debug, Clone)]

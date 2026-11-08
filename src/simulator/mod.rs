@@ -1,12 +1,12 @@
 use comfy_table::modifiers::UTF8_ROUND_CORNERS;
 use comfy_table::presets::UTF8_FULL;
 use comfy_table::{Cell, Color, Row, Table};
-use rand::seq::SliceRandom;
 use rand::Rng;
+use rand::seq::SliceRandom;
 use std::sync::Arc;
 
-use crate::balancer::policies::{LeastLoadedPolicy, PrefixAwarePolicy, RoundRobinPolicy};
 use crate::balancer::RoutingPolicy;
+use crate::balancer::policies::{LeastLoadedPolicy, PrefixAwarePolicy, RoundRobinPolicy};
 use crate::shadow_cache::{WorkerPool, WorkerReplica};
 use crate::trie::RadixTree;
 
@@ -127,7 +127,9 @@ impl ClusterSimulator {
             in_flight.retain_mut(|(w_id, ticks)| {
                 if *ticks <= 1 {
                     if let Some(w) = pool.get_worker(w_id) {
-                        w.read().active_requests.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                        w.read()
+                            .active_requests
+                            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                     }
                     false
                 } else {
@@ -149,7 +151,11 @@ impl ClusterSimulator {
             // Warm cache hit = ~0.04ms per block (fast memory lookup)
             let cold_blocks = prompt_blocks.len().saturating_sub(decision.matched_blocks);
             let prefill_ms = (cold_blocks as f64 * 1.2) + (decision.matched_blocks as f64 * 0.04);
-            let queue_penalty_ms = if in_flight.len() >= concurrency_slots { 2.5 } else { 0.0 };
+            let queue_penalty_ms = if in_flight.len() >= concurrency_slots {
+                2.5
+            } else {
+                0.0
+            };
             let ttft_ms = prefill_ms + queue_penalty_ms;
 
             ttft_samples.push(ttft_ms);
@@ -157,8 +163,14 @@ impl ClusterSimulator {
 
             // Mark worker as active in-flight
             if let Some(worker_arc) = pool.get_worker(&decision.worker_id) {
-                worker_arc.read().active_requests.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                in_flight.push((decision.worker_id.clone(), (prefill_ms as usize).max(2).min(8)));
+                worker_arc
+                    .read()
+                    .active_requests
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                in_flight.push((
+                    decision.worker_id.clone(),
+                    (prefill_ms as usize).clamp(2, 8),
+                ));
 
                 let mut worker = worker_arc.write();
                 let evicted = worker.record_request(prompt_blocks, decision.matched_blocks);
@@ -198,9 +210,15 @@ impl ClusterSimulator {
         let workload = self.generate_synthetic_workload();
 
         let policies: Vec<(Arc<dyn RoutingPolicy>, &str)> = vec![
-            (Arc::new(RoundRobinPolicy::default()), "Round-Robin (Prefix-Blind)"),
-            (Arc::new(LeastLoadedPolicy::default()), "Least-Loaded (Prefix-Blind)"),
-            (Arc::new(PrefixAwarePolicy::default()), "RadixGate (Prefix-Aware)"),
+            (
+                Arc::new(RoundRobinPolicy::default()),
+                "Round-Robin (Prefix-Blind)",
+            ),
+            (Arc::new(LeastLoadedPolicy), "Least-Loaded (Prefix-Blind)"),
+            (
+                Arc::new(PrefixAwarePolicy::default()),
+                "RadixGate (Prefix-Aware)",
+            ),
         ];
 
         policies
@@ -226,7 +244,10 @@ impl ClusterSimulator {
                 Cell::new("Speedup vs RR").fg(Color::Magenta),
             ]);
 
-        let baseline_prefill = results.first().map(|r| r.total_prefill_compute_ms).unwrap_or(1.0);
+        let baseline_prefill = results
+            .first()
+            .map(|r| r.total_prefill_compute_ms)
+            .unwrap_or(1.0);
 
         for res in results {
             let speedup = baseline_prefill / res.total_prefill_compute_ms.max(0.001);
@@ -250,9 +271,15 @@ impl ClusterSimulator {
             ]));
         }
 
-        println!("\n==========================================================================================");
-        println!("               RADIX-GATE: DISTRIBUTED KV-CACHE ROUTER BENCHMARK RESULTS                  ");
-        println!("==========================================================================================");
+        println!(
+            "\n=========================================================================================="
+        );
+        println!(
+            "               RADIX-GATE: DISTRIBUTED KV-CACHE ROUTER BENCHMARK RESULTS                  "
+        );
+        println!(
+            "=========================================================================================="
+        );
         println!("{table}\n");
     }
 }

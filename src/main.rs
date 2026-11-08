@@ -5,7 +5,7 @@ use std::sync::Arc;
 use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-use radix_gate::proxy::{create_router, AppState};
+use radix_gate::proxy::{AppState, create_router};
 use radix_gate::shadow_cache::{WorkerPool, WorkerReplica};
 use radix_gate::simulator::{BenchmarkConfig, ClusterSimulator};
 use radix_gate::tokenizer::BlockChunker;
@@ -102,7 +102,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let chunker = BlockChunker::new(block_size);
 
             if let Some(upstream_list) = upstreams {
-                let urls: Vec<&str> = upstream_list.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+                let urls: Vec<&str> = upstream_list
+                    .split(',')
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty())
+                    .collect();
                 for (idx, url) in urls.into_iter().enumerate() {
                     let id = format!("upstream-{:02}", idx + 1);
                     worker_pool.add_worker(WorkerReplica::new(id, url.to_string(), 20_000, 64));
@@ -115,17 +119,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
-            let app_state = Arc::new(AppState::new(
-                radix_tree,
-                worker_pool.clone(),
-                chunker,
-            ));
+            let app_state = Arc::new(AppState::new(radix_tree, worker_pool.clone(), chunker));
 
             let router = create_router(app_state);
             let addr: SocketAddr = format!("{}:{}", host, port).parse()?;
             info!("[RadixGate] Server listening on http://{}", addr);
-            info!("[RadixGate] Registered {} active inference workers", worker_pool.len());
-            info!("[RadixGate] Endpoints: POST /v1/chat/completions | POST /v1/messages | GET /metrics");
+            info!(
+                "[RadixGate] Registered {} active inference workers",
+                worker_pool.len()
+            );
+            info!(
+                "[RadixGate] Endpoints: POST /v1/chat/completions | POST /v1/messages | GET /metrics"
+            );
 
             let listener = tokio::net::TcpListener::bind(addr).await?;
             axum::serve(listener, router).await?;

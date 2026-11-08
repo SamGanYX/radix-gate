@@ -1,5 +1,5 @@
 use crate::trie::BlockHash;
-use xxhash_rust::xxh3::xxh3_64;
+use xxhash_rust::xxh3::{Xxh3, xxh3_64};
 
 /// Utility for chunking text and prompt messages into deterministic 64-bit block hashes.
 #[derive(Debug, Clone)]
@@ -30,20 +30,25 @@ impl BlockChunker {
             .collect()
     }
 
-    /// Fast, deterministic chunker for string prompts.
-    /// Splits on whitespace boundaries with window size approximation.
+    /// Fast, zero-allocation chunker for string prompts.
+    /// Streams word byte slices directly into XXH3 without intermediate String allocations.
     pub fn chunk_text(&self, text: &str) -> Vec<BlockHash> {
         let words: Vec<&str> = text.split_whitespace().collect();
         if words.is_empty() {
             return Vec::new();
         }
 
-        // Each word is ~1.3 tokens on average. We chunk by block_size words
         words
             .chunks(self.block_size)
             .map(|chunk| {
-                let joined = chunk.join(" ");
-                xxh3_64(joined.as_bytes())
+                let mut hasher = Xxh3::new();
+                for (i, word) in chunk.iter().enumerate() {
+                    if i > 0 {
+                        hasher.update(b" ");
+                    }
+                    hasher.update(word.as_bytes());
+                }
+                hasher.digest()
             })
             .collect()
     }
@@ -64,12 +69,7 @@ impl BlockChunker {
 
 fn bytemuck_or_slice_u32_to_bytes(slice: &[u32]) -> &[u8] {
     // Safe alignment-preserving cast of u32 slice to byte slice
-    unsafe {
-        std::slice::from_raw_parts(
-            slice.as_ptr() as *const u8,
-            slice.len() * std::mem::size_of::<u32>(),
-        )
-    }
+    unsafe { std::slice::from_raw_parts(slice.as_ptr() as *const u8, std::mem::size_of_val(slice)) }
 }
 
 #[cfg(test)]

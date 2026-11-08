@@ -57,7 +57,11 @@ impl RoutingPolicy for PrefixAwarePolicy {
                 continue;
             }
 
-            let matched = match_result.worker_matches.get(id).copied().unwrap_or(0);
+            let matched = match_result
+                .worker_matches
+                .get(id.as_str())
+                .copied()
+                .unwrap_or(0);
             let cache_affinity = matched as f64 / total_blocks as f64;
             let load_factor = worker.load_factor();
 
@@ -115,7 +119,11 @@ impl RoutingPolicy for RoundRobinPolicy {
 
         // Calculate matched blocks for tracking comparison
         let match_result = radix_tree.find_longest_prefix(prompt_blocks);
-        let matched = match_result.worker_matches.get(w_id).copied().unwrap_or(0);
+        let matched = match_result
+            .worker_matches
+            .get(w_id.as_str())
+            .copied()
+            .unwrap_or(0);
 
         Some(RoutingDecision {
             worker_id: w_id.clone(),
@@ -168,7 +176,7 @@ impl RoutingPolicy for LeastLoadedPolicy {
         let match_result = radix_tree.find_longest_prefix(prompt_blocks);
         let matched = match_result
             .worker_matches
-            .get(&chosen_id)
+            .get(chosen_id.as_str())
             .copied()
             .unwrap_or(0);
 

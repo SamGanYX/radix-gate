@@ -1,5 +1,5 @@
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use axum::body::Body;
 use axum::extract::State;
@@ -9,8 +9,8 @@ use parking_lot::RwLock;
 use serde_json::json;
 use tracing::{info, warn};
 
-use crate::balancer::policies::PrefixAwarePolicy;
 use crate::balancer::RoutingPolicy;
+use crate::balancer::policies::PrefixAwarePolicy;
 use crate::proxy::types::ChatRequest;
 use crate::shadow_cache::WorkerPool;
 use crate::tokenizer::BlockChunker;
@@ -210,11 +210,19 @@ async fn handle_routing(
 
     // 5. Attempt live upstream forwarding if endpoint is a real upstream server
     let endpoint_url = decision.endpoint_url.clone();
-    let is_real_upstream = endpoint_url.starts_with("http://") || endpoint_url.starts_with("https://");
+    let is_real_upstream =
+        endpoint_url.starts_with("http://") || endpoint_url.starts_with("https://");
     let is_mock_port = endpoint_url.contains(":800"); // default mock ports 8001-8004
 
     let live_response = if is_real_upstream && !is_mock_port {
-        try_forward_upstream(&state.client, &endpoint_url, &headers, &payload, is_anthropic).await
+        try_forward_upstream(
+            &state.client,
+            &endpoint_url,
+            &headers,
+            &payload,
+            is_anthropic,
+        )
+        .await
     } else {
         None
     };
@@ -243,7 +251,10 @@ async fn handle_routing(
     let headers_mut = response.headers_mut();
     headers_mut.insert(
         "X-Radix-Worker",
-        decision.worker_id.parse().unwrap_or_else(|_| "unknown".parse().unwrap()),
+        decision
+            .worker_id
+            .parse()
+            .unwrap_or_else(|_| "unknown".parse().unwrap()),
     );
     headers_mut.insert(
         "X-Radix-Matched-Blocks",
@@ -291,7 +302,8 @@ async fn try_forward_upstream(
 
     match req_builder.send().await {
         Ok(upstream_resp) => {
-            let status = StatusCode::from_u16(upstream_resp.status().as_u16()).unwrap_or(StatusCode::OK);
+            let status =
+                StatusCode::from_u16(upstream_resp.status().as_u16()).unwrap_or(StatusCode::OK);
             let content_type = upstream_resp
                 .headers()
                 .get("content-type")
@@ -305,7 +317,9 @@ async fn try_forward_upstream(
                 .status(status)
                 .header("content-type", content_type)
                 .body(body)
-                .unwrap_or_else(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Stream building error").into_response());
+                .unwrap_or_else(|_| {
+                    (StatusCode::INTERNAL_SERVER_ERROR, "Stream building error").into_response()
+                });
 
             Some(response)
         }

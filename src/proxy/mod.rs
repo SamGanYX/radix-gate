@@ -1,8 +1,8 @@
 pub mod handler;
 pub mod types;
 
-use axum::routing::{get, post};
 use axum::Router;
+use axum::routing::{get, post};
 use std::sync::Arc;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;

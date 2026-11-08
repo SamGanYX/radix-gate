@@ -109,12 +109,10 @@ impl ChatRequest {
 
     /// Checks if the request contains explicit Anthropic prompt caching breakpoints.
     pub fn has_explicit_cache_breakpoints(&self) -> bool {
-        if let Some(sys) = &self.system {
-            if let Some(arr) = sys.as_array() {
-                for item in arr {
-                    if item.get("cache_control").is_some() {
-                        return true;
-                    }
+        if let Some(arr) = self.system.as_ref().and_then(|s| s.as_array()) {
+            for item in arr {
+                if item.get("cache_control").is_some() {
+                    return true;
                 }
             }
         }
@@ -160,9 +158,14 @@ mod tests {
                 "role": "user",
                 "content": "Hello"
             }]
-        })).unwrap();
+        }))
+        .unwrap();
 
         assert!(request.has_explicit_cache_breakpoints());
-        assert!(request.extract_prompt_text().contains("Large documentation prefix"));
+        assert!(
+            request
+                .extract_prompt_text()
+                .contains("Large documentation prefix")
+        );
     }
 }

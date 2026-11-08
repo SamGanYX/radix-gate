@@ -1,8 +1,9 @@
 pub mod node;
 
-use std::collections::{HashMap, HashSet};
-use std::time::Instant;
 pub use node::{BlockHash, RadixNode, WorkerId};
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use std::time::Instant;
 
 /// A thread-safe Radix Tree (compact Trie) for matching sequences of prompt token block hashes
 /// across a distributed cluster of LLM inference workers.
@@ -40,12 +41,13 @@ impl RadixTree {
         if blocks.is_empty() {
             return;
         }
-        Self::insert_recursive(&mut self.root, blocks, worker_id);
+        let w_arc: WorkerId = Arc::from(worker_id);
+        Self::insert_recursive(&mut self.root, blocks, &w_arc);
     }
 
-    fn insert_recursive(current: &mut RadixNode, blocks: &[BlockHash], worker_id: &str) {
+    fn insert_recursive(current: &mut RadixNode, blocks: &[BlockHash], worker_id: &WorkerId) {
         if blocks.is_empty() {
-            current.cached_workers.insert(worker_id.to_string());
+            current.cached_workers.insert(Arc::clone(worker_id));
             current.last_accessed = Instant::now();
             current.hit_count += 1;
             return;
@@ -64,7 +66,7 @@ impl RadixTree {
 
             if common_len == child.prefix.len() {
                 // Entire child prefix matches, recurse into child
-                child.cached_workers.insert(worker_id.to_string());
+                child.cached_workers.insert(Arc::clone(worker_id));
                 child.last_accessed = Instant::now();
                 child.hit_count += 1;
                 Self::insert_recursive(child, &blocks[common_len..], worker_id);
@@ -82,7 +84,7 @@ impl RadixTree {
                 // Truncate existing child prefix to the common part
                 child.prefix.truncate(common_len);
                 child.children.clear();
-                child.cached_workers.insert(worker_id.to_string());
+                child.cached_workers.insert(Arc::clone(worker_id));
                 child.last_accessed = Instant::now();
                 child.hit_count += 1;
 
@@ -92,17 +94,15 @@ impl RadixTree {
                 } else {
                     // New branch for the rest of blocks
                     let new_branch_key = blocks[common_len];
-                    let new_node = RadixNode::new(
-                        blocks[common_len..].to_vec(),
-                        Some(worker_id.to_string()),
-                    );
+                    let new_node =
+                        RadixNode::new(blocks[common_len..].to_vec(), Some(Arc::clone(worker_id)));
                     child.children.insert(split_key, split_node);
                     child.children.insert(new_branch_key, new_node);
                 }
             }
         } else {
             // No existing branch starts with `first`, create a new one
-            let new_node = RadixNode::new(blocks.to_vec(), Some(worker_id.to_string()));
+            let new_node = RadixNode::new(blocks.to_vec(), Some(Arc::clone(worker_id)));
             current.children.insert(first, new_node);
         }
     }
@@ -137,7 +137,7 @@ impl RadixTree {
 
                 // For all workers on this child, record that they matched up to this depth
                 for worker in &child.cached_workers {
-                    let entry = result.worker_matches.entry(worker.clone()).or_insert(0);
+                    let entry = result.worker_matches.entry(Arc::clone(worker)).or_insert(0);
                     if matched_depth > *entry {
                         *entry = matched_depth;
                     }
@@ -168,7 +168,7 @@ impl RadixTree {
     }
 
     fn evict_worker_recursive(node: &mut RadixNode, worker_id: &str) {
-        node.cached_workers.remove(worker_id);
+        node.cached_workers.retain(|w| &**w != worker_id);
         for child in node.children.values_mut() {
             Self::evict_worker_recursive(child, worker_id);
         }
@@ -180,13 +180,13 @@ impl RadixTree {
     }
 
     fn prune_recursive(node: &mut RadixNode) -> bool {
-        node.children.retain(|_, child| Self::prune_recursive(child));
+        node.children
+            .retain(|_, child| Self::prune_recursive(child));
         !node.children.is_empty() || !node.cached_workers.is_empty()
     }
 
     /// Computes summary metrics of the current Radix Tree state.
     pub fn stats(&self) -> (usize, usize) {
-        // (total_nodes, total_unique_workers)
         let mut total_nodes = 0;
         let mut all_workers = HashSet::new();
         Self::collect_stats(&self.root, &mut total_nodes, &mut all_workers);
@@ -196,7 +196,7 @@ impl RadixTree {
     fn collect_stats(node: &RadixNode, count: &mut usize, workers: &mut HashSet<WorkerId>) {
         *count += 1;
         for w in &node.cached_workers {
-            workers.insert(w.clone());
+            workers.insert(Arc::clone(w));
         }
         for child in node.children.values() {
             Self::collect_stats(child, count, workers);
