@@ -31,6 +31,9 @@ enum Commands {
         block_size: usize,
         #[arg(long, default_value_t = 4)]
         mock_workers: usize,
+        /// Comma-separated list of live upstream worker URLs (e.g. "http://10.0.0.1:8000,http://10.0.0.2:8000")
+        #[arg(long)]
+        upstreams: Option<String>,
     },
     /// Run the empirical comparative benchmark suite (Round-Robin vs Least-Loaded vs RadixGate)
     Bench {
@@ -92,15 +95,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             port,
             block_size,
             mock_workers,
+            upstreams,
         } => {
             let radix_tree = Arc::new(RwLock::new(RadixTree::new(block_size)));
             let worker_pool = Arc::new(WorkerPool::new());
             let chunker = BlockChunker::new(block_size);
 
-            for i in 0..mock_workers {
-                let id = format!("worker-{:02}", i + 1);
-                let url = format!("http://127.0.0.1:800{}", i + 1);
-                worker_pool.add_worker(WorkerReplica::new(id, url, 10_000, 32));
+            if let Some(upstream_list) = upstreams {
+                let urls: Vec<&str> = upstream_list.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+                for (idx, url) in urls.into_iter().enumerate() {
+                    let id = format!("upstream-{:02}", idx + 1);
+                    worker_pool.add_worker(WorkerReplica::new(id, url.to_string(), 20_000, 64));
+                }
+            } else {
+                for i in 0..mock_workers {
+                    let id = format!("worker-{:02}", i + 1);
+                    let url = format!("http://127.0.0.1:800{}", i + 1);
+                    worker_pool.add_worker(WorkerReplica::new(id, url, 10_000, 32));
+                }
             }
 
             let app_state = Arc::new(AppState::new(
@@ -112,7 +124,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let router = create_router(app_state);
             let addr: SocketAddr = format!("{}:{}", host, port).parse()?;
             info!("[RadixGate] Server listening on http://{}", addr);
-            info!("[RadixGate] Loaded {} upstream workers into pool", mock_workers);
+            info!("[RadixGate] Registered {} active inference workers", worker_pool.len());
             info!("[RadixGate] Endpoints: POST /v1/chat/completions | POST /v1/messages | GET /metrics");
 
             let listener = tokio::net::TcpListener::bind(addr).await?;

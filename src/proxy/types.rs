@@ -1,5 +1,12 @@
 use serde::{Deserialize, Serialize};
 
+/// Represents an explicit prompt segment with optional prompt cache control.
+#[derive(Debug, Clone)]
+pub struct PromptSegment {
+    pub text: String,
+    pub has_cache_control: bool,
+}
+
 /// Generic message block supporting both string and structured content.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
@@ -23,6 +30,34 @@ impl ChatMessage {
         } else {
             self.content.to_string()
         }
+    }
+
+    /// Extracts granular segments and detects Anthropic `cache_control: {"type": "ephemeral"}` markers.
+    pub fn extract_segments(&self) -> Vec<PromptSegment> {
+        let mut segments = Vec::new();
+
+        if let Some(s) = self.content.as_str() {
+            segments.push(PromptSegment {
+                text: s.to_string(),
+                has_cache_control: false,
+            });
+        } else if let Some(arr) = self.content.as_array() {
+            for item in arr {
+                let text = item.get("text").and_then(|t| t.as_str()).unwrap_or("");
+                let has_cache_control = item.get("cache_control").is_some();
+                segments.push(PromptSegment {
+                    text: text.to_string(),
+                    has_cache_control,
+                });
+            }
+        } else {
+            segments.push(PromptSegment {
+                text: self.content.to_string(),
+                has_cache_control: false,
+            });
+        }
+
+        segments
     }
 }
 
@@ -50,6 +85,13 @@ impl ChatRequest {
             full_prompt.push_str("<|system|>\n");
             if let Some(s) = sys.as_str() {
                 full_prompt.push_str(s);
+            } else if let Some(arr) = sys.as_array() {
+                for item in arr {
+                    if let Some(t) = item.get("text").and_then(|x| x.as_str()) {
+                        full_prompt.push_str(t);
+                        full_prompt.push(' ');
+                    }
+                }
             } else {
                 full_prompt.push_str(&sys.to_string());
             }
@@ -64,6 +106,29 @@ impl ChatRequest {
 
         full_prompt
     }
+
+    /// Checks if the request contains explicit Anthropic prompt caching breakpoints.
+    pub fn has_explicit_cache_breakpoints(&self) -> bool {
+        if let Some(sys) = &self.system {
+            if let Some(arr) = sys.as_array() {
+                for item in arr {
+                    if item.get("cache_control").is_some() {
+                        return true;
+                    }
+                }
+            }
+        }
+
+        for msg in &self.messages {
+            for seg in msg.extract_segments() {
+                if seg.has_cache_control {
+                    return true;
+                }
+            }
+        }
+
+        false
+    }
 }
 
 /// Proxy routing response metadata headers and wrapper.
@@ -75,4 +140,29 @@ pub struct GatewayMetricsResponse {
     pub matched_blocks: usize,
     pub total_blocks: usize,
     pub cache_hit_ratio: f64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_anthropic_cache_control_detection() {
+        let request: ChatRequest = serde_json::from_value(json!({
+            "model": "claude-3-5-sonnet-20241022",
+            "system": [{
+                "type": "text",
+                "text": "Large documentation prefix...",
+                "cache_control": {"type": "ephemeral"}
+            }],
+            "messages": [{
+                "role": "user",
+                "content": "Hello"
+            }]
+        })).unwrap();
+
+        assert!(request.has_explicit_cache_breakpoints());
+        assert!(request.extract_prompt_text().contains("Large documentation prefix"));
+    }
 }

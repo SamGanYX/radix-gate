@@ -1,12 +1,13 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use axum::body::Body;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Json, Response};
 use parking_lot::RwLock;
 use serde_json::json;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::balancer::policies::PrefixAwarePolicy;
 use crate::balancer::RoutingPolicy;
@@ -40,7 +41,11 @@ impl AppState {
             worker_pool,
             chunker,
             policy: Arc::new(PrefixAwarePolicy::default()),
-            client: reqwest::Client::builder().build().unwrap(),
+            client: reqwest::Client::builder()
+                .pool_max_idle_per_host(32)
+                .tcp_nodelay(true)
+                .build()
+                .unwrap(),
             total_requests: AtomicU64::new(0),
             total_matched_blocks: AtomicU64::new(0),
             total_prompt_blocks: AtomicU64::new(0),
@@ -123,7 +128,7 @@ pub async fn handle_anthropic_messages(
 
 async fn handle_routing(
     state: Arc<AppState>,
-    _headers: HeaderMap,
+    headers: HeaderMap,
     payload: ChatRequest,
     is_anthropic: bool,
 ) -> Response {
@@ -203,6 +208,17 @@ async fn handle_routing(
         }
     }
 
+    // 5. Attempt live upstream forwarding if endpoint is a real upstream server
+    let endpoint_url = decision.endpoint_url.clone();
+    let is_real_upstream = endpoint_url.starts_with("http://") || endpoint_url.starts_with("https://");
+    let is_mock_port = endpoint_url.contains(":800"); // default mock ports 8001-8004
+
+    let live_response = if is_real_upstream && !is_mock_port {
+        try_forward_upstream(&state.client, &endpoint_url, &headers, &payload, is_anthropic).await
+    } else {
+        None
+    };
+
     // Decrement worker active requests
     {
         let worker = worker_arc.read();
@@ -211,55 +227,19 @@ async fn handle_routing(
             .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
     }
 
-    // 5. Build response with Radix Gateway metadata headers
     let hit_ratio = if total_blocks > 0 {
         decision.matched_blocks as f64 / total_blocks as f64
     } else {
         0.0
     };
 
-    let response_body = if is_anthropic {
-        json!({
-            "id": format!("msg_{}", uuid_simple()),
-            "type": "message",
-            "role": "assistant",
-            "content": [{
-                "type": "text",
-                "text": format!("Response generated via RadixGate [routed to {}].", decision.worker_id)
-            }],
-            "model": payload.model,
-            "usage": {
-                "input_tokens": total_blocks * state.chunker.block_size,
-                "output_tokens": 42,
-                "cache_creation_input_tokens": (total_blocks.saturating_sub(decision.matched_blocks)) * state.chunker.block_size,
-                "cache_read_input_tokens": decision.matched_blocks * state.chunker.block_size
-            }
-        })
-    } else {
-        json!({
-            "id": format!("chatcmpl_{}", uuid_simple()),
-            "object": "chat.completion",
-            "model": payload.model,
-            "choices": [{
-                "index": 0,
-                "message": {
-                    "role": "assistant",
-                    "content": format!("Response generated via RadixGate [routed to {}].", decision.worker_id)
-                },
-                "finish_reason": "stop"
-            }],
-            "usage": {
-                "prompt_tokens": total_blocks * state.chunker.block_size,
-                "completion_tokens": 42,
-                "total_tokens": (total_blocks * state.chunker.block_size) + 42,
-                "prompt_tokens_details": {
-                    "cached_tokens": decision.matched_blocks * state.chunker.block_size
-                }
-            }
-        })
+    // 6. Return live response if upstream succeeded, else return high-fidelity mock
+    let mut response = match live_response {
+        Some(resp) => resp,
+        None => build_mock_response(&state, &payload, &decision, is_anthropic),
     };
 
-    let mut response = Json(response_body).into_response();
+    // Inject Radix Gateway telemetry headers
     let headers_mut = response.headers_mut();
     headers_mut.insert(
         "X-Radix-Worker",
@@ -279,6 +259,115 @@ async fn handle_routing(
     );
 
     response
+}
+
+/// Attempts to proxy the request directly to a live upstream vLLM/Anthropic worker.
+async fn try_forward_upstream(
+    client: &reqwest::Client,
+    endpoint_base: &str,
+    client_headers: &HeaderMap,
+    payload: &ChatRequest,
+    is_anthropic: bool,
+) -> Option<Response> {
+    let path = if is_anthropic {
+        "/v1/messages"
+    } else {
+        "/v1/chat/completions"
+    };
+    let target_url = format!("{}{}", endpoint_base.trim_end_matches('/'), path);
+
+    let mut req_builder = client.post(&target_url).json(payload);
+
+    // Forward auth headers if present
+    if let Some(auth) = client_headers.get("authorization") {
+        req_builder = req_builder.header("authorization", auth);
+    }
+    if let Some(api_key) = client_headers.get("x-api-key") {
+        req_builder = req_builder.header("x-api-key", api_key);
+    }
+    if let Some(anthropic_ver) = client_headers.get("anthropic-version") {
+        req_builder = req_builder.header("anthropic-version", anthropic_ver);
+    }
+
+    match req_builder.send().await {
+        Ok(upstream_resp) => {
+            let status = StatusCode::from_u16(upstream_resp.status().as_u16()).unwrap_or(StatusCode::OK);
+            let content_type = upstream_resp
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("application/json")
+                .to_string();
+
+            // Stream response if SSE or streaming body
+            let body = Body::from_stream(upstream_resp.bytes_stream());
+            let response = Response::builder()
+                .status(status)
+                .header("content-type", content_type)
+                .body(body)
+                .unwrap_or_else(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Stream building error").into_response());
+
+            Some(response)
+        }
+        Err(err) => {
+            warn!(url = %target_url, error = %err, "Upstream connection failed; falling back to simulated response");
+            None
+        }
+    }
+}
+
+/// Generates a realistic mock response matching OpenAI / Anthropic specification.
+fn build_mock_response(
+    state: &AppState,
+    payload: &ChatRequest,
+    decision: &crate::balancer::RoutingDecision,
+    is_anthropic: bool,
+) -> Response {
+    let total_blocks = decision.total_blocks;
+    let block_size = state.chunker.block_size;
+
+    let response_body = if is_anthropic {
+        json!({
+            "id": format!("msg_{}", uuid_simple()),
+            "type": "message",
+            "role": "assistant",
+            "content": [{
+                "type": "text",
+                "text": format!("Response generated via RadixGate [routed to {}].", decision.worker_id)
+            }],
+            "model": payload.model,
+            "usage": {
+                "input_tokens": total_blocks * block_size,
+                "output_tokens": 42,
+                "cache_creation_input_tokens": (total_blocks.saturating_sub(decision.matched_blocks)) * block_size,
+                "cache_read_input_tokens": decision.matched_blocks * block_size
+            }
+        })
+    } else {
+        json!({
+            "id": format!("chatcmpl_{}", uuid_simple()),
+            "object": "chat.completion",
+            "model": payload.model,
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": format!("Response generated via RadixGate [routed to {}].", decision.worker_id)
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": total_blocks * block_size,
+                "completion_tokens": 42,
+                "total_tokens": (total_blocks * block_size) + 42,
+                "prompt_tokens_details": {
+                    "cached_tokens": decision.matched_blocks * block_size
+                }
+            }
+        })
+    };
+
+    Json(response_body).into_response()
 }
 
 fn uuid_simple() -> String {
