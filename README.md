@@ -1,149 +1,201 @@
-# ⚡ RadixGate: Prefix-Aware KV-Cache Gateway & Radix Router
+# RadixGate
+
+Deterministic, prefix-aware reverse proxy and radix router for distributed LLM inference clusters.
 
 [![CI](https://github.com/SamGanYX/radix-gate/actions/workflows/ci.yml/badge.svg)](https://github.com/SamGanYX/radix-gate/actions)
-[![Rust](https://img.shields.io/badge/rust-1.80%2B-orange.svg)](https://www.rust-lang.org)
+[![Rust](https://img.shields.io/badge/rust-1.80%2B-informational.svg)](https://www.rust-lang.org)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
-[![Target](https://img.shields.io/badge/target-Inference%20Infra%20%7C%20Anthropic%20%7C%20vLLM-purple.svg)]()
-
-> **A high-throughput, deterministic reverse proxy and Radix Router that balances distributed LLM inference clusters by tracking GPU KV-cache state and maximizing prompt prefix reusability.**
 
 ---
 
-## 🎯 The Motivation: Why Prefix Routing Matters
+## Overview
 
-Modern LLM inference engines (vLLM, SGLang, and Anthropic Claude) feature **prompt caching** (PagedAttention / RadixAttention). Reusing cached key-value (KV) states reduces Time-To-First-Token (TTFT) by up to **85%** and cuts token serving compute costs by up to **90%**.
+Modern inference engines (vLLM, SGLang, and Claude) implement prompt KV-cache reuse (PagedAttention, RadixAttention) to bypass prefill matrix multiplications for shared prefixes. In multi-replica deployments, default layer-7 load balancers (round-robin, random, or least-connections) route traffic without prefix awareness. When multi-turn agent turns or queries sharing a common system prompt are scattered across arbitrary workers, cluster cache hit rates deteriorate and GPU VRAM suffers cache thrashing.
 
-### The Failure Mode of Distributed LLM Serving
-In multi-worker production clusters ($N > 1$), standard L7 load balancers (Round-Robin, Random, or Least-Connections) are **prefix-blind**:
-- Turn 1 of an agentic workflow (with an 8,000-token system prompt and tool schema) is routed to **Worker 1**.
-- Turn 2 is routed to **Worker 2** $\to$ Worker 2 has a cold cache and must recompute all 8,000 tokens from scratch.
-- Turn 3 is routed to **Worker 3** $\to$ Cold cache again.
+RadixGate operates as an L7 reverse proxy that inspects incoming prompt token streams, tracks worker KV-cache residency via a compressed radix trie, and routes requests to maximize cache reuse while balancing in-flight queue depth.
 
-This destroys KV-cache locality, causes massive VRAM cache thrashing, and reduces cluster cache hit rates to near zero under concurrent load.
-
-**RadixGate solves this at the gateway layer.** By maintaining a shadow Radix Tree of what block prefixes are hot across each worker replica, incoming requests are routed deterministically to the worker that possesses the Longest Common Prefix (LCP), while penalizing queue depth to prevent hot-spotting.
+```
+                    Client Request
+                          │
+                          ▼
+             ┌───────────────────────────┐
+             │         RadixGate         │
+             │   (Reverse Proxy / L7)    │
+             ├───────────────────────────┤
+             │ • Chunk Hasher (XXH3-64)  │
+             │ • Concurrent Radix Trie   │
+             │ • Shadow LRU State Mirror │
+             │ • Concurrency-Aware Score │
+             └─────────────┬─────────────┘
+                           │
+       ┌───────────────────┼───────────────────┐
+       ▼                   ▼                   ▼
+┌──────────────┐    ┌──────────────┐    ┌──────────────┐
+│  Worker 01   │    │  Worker 02   │    │  Worker 03   │
+│ (LCP Match)  │    │  (Partial)   │    │   (Cold)     │
+└──────────────┘    └──────────────┘    └──────────────┘
+```
 
 ---
 
-## 🏛️ System Architecture
+## Routing Objective Function
 
-```
-                             [ Client / Agent Request ]
-                                         │
-                                         ▼
-                      ┌──────────────────────────────────────┐
-                      │              RadixGate               │
-                      │   (High-Performance Reverse Proxy)   │
-                      ├──────────────────────────────────────┤
-                      │  1. Fast Token Chunker (XXH3-64)     │
-                      │  2. Radix Tree Prefix Matcher        │
-                      │  3. Affinity + Queue Score Engine    │
-                      │  4. Worker Shadow LRU Tracker        │
-                      └──────────────────┬───────────────────┘
-                                         │
-                 ┌───────────────────────┼───────────────────────┐
-                 ▼                       ▼                       ▼
-      ┌─────────────────────┐ ┌─────────────────────┐ ┌─────────────────────┐
-      │     Worker 01       │ │     Worker 02       │ │     Worker 03       │
-      │  (vLLM / SGLang)    │ │  (vLLM / SGLang)    │ │  (vLLM / SGLang)    │
-      │ Hot: [SysPrompt A]  │ │ Hot: [SysPrompt B]  │ │ Hot: [SysPrompt C]  │
-      └─────────────────────┘ └─────────────────────┘ └─────────────────────┘
-```
-
-### Routing Objective Function
-Routing decisions optimize a multi-objective trade-off between cache affinity and active worker concurrency:
+The router optimizes a joint objective balancing Longest Common Prefix (LCP) reuse against replica in-flight queue saturation:
 
 $$\text{Score}(W_i) = \alpha \cdot \frac{\text{LCP}(P, W_i)}{|P|} - \beta \cdot \frac{\text{ActiveRequests}(W_i)}{\text{MaxConcurrency}_i}$$
 
 Where:
-- $\text{LCP}(P, W_i)$ is the Longest Common Prefix (in token blocks) between request $P$ and worker $W_i$.
-- $\alpha = 0.75$ (affinity weight), $\beta = 0.25$ (load penalty).
+- $P$ is the sequence of token block hashes for the incoming prompt.
+- $\text{LCP}(P, W_i)$ is the length of the longest matching prefix cached on worker $W_i$.
+- $|P|$ is the total number of blocks in the prompt.
+- $\alpha \in [0, 1]$ controls cache affinity weighting (default: `0.75`).
+- $\beta \in [0, 1]$ controls concurrency penalty weighting (default: `0.25`).
 
 ---
 
-## 📊 Empirical Benchmark Results
+## Benchmark Results
 
-Running against 20 concurrent agentic personas across 4 worker replicas with constrained KV memory (150 blocks/worker) under interleaved traffic:
+Evaluation was conducted using a synthetic trace of 20 concurrent agent sessions (shared system definitions and tool schemas, interleaved multi-turn queries) across 4 simulated inference workers under constrained KV cache capacity (150 blocks per worker):
 
-```
-==========================================================================================
-               RADIX-GATE: DISTRIBUTED KV-CACHE ROUTER BENCHMARK RESULTS                  
-==========================================================================================
-╭─────────────────────────────┬──────────┬───────────────────┬───────────────┬───────────────┬───────────────┬─────────────────────┬───────────────╮
-│ Routing Policy              ┆ Requests ┆ KV Cache Hit Rate ┆ Avg TTFT (ms) ┆ P95 TTFT (ms) ┆ P99 TTFT (ms) ┆ Prefill Compute (s) ┆ Speedup vs RR │
-╞═════════════════════════════╪══════════╪═══════════════════╪═══════════════╪═══════════════╪═══════════════╪═════════════════════╪═══════════════╡
-│ Round-Robin (Prefix-Blind)  ┆ 1000     ┆ 68.7%             ┆ 11.65 ms      ┆ 32.40 ms      ┆ 46.80 ms      ┆ 11.65 s             ┆ 1.00x         │
-├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
-│ Least-Loaded (Prefix-Blind) ┆ 1000     ┆ 68.9%             ┆ 11.58 ms      ┆ 32.40 ms      ┆ 46.80 ms      ┆ 11.58 s             ┆ 1.01x         │
-├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
-│ RadixGate (Prefix-Aware)    ┆ 1000     ┆ 86.6%             ┆ 5.64 ms       ┆ 20.28 ms      ┆ 38.40 ms      ┆ 5.64 s              ┆ 2.06x         │
-╰─────────────────────────────┴──────────┴───────────────────┴───────────────┴───────────────┴───────────────┴─────────────────────┴───────────────╯
-```
+| Routing Policy | Total Requests | Cache Hit Rate | Mean TTFT | P95 TTFT | P99 TTFT | Total Prefill Compute | Speedup vs RR |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| Round-Robin (Prefix-Blind) | 1,000 | 68.7% | 11.65 ms | 32.40 ms | 46.80 ms | 11.65 s | 1.00x |
+| Least-Loaded (Prefix-Blind) | 1,000 | 68.9% | 11.58 ms | 32.40 ms | 46.80 ms | 11.58 s | 1.01x |
+| **RadixGate (Prefix-Aware)** | **1,000** | **86.6%** | **5.64 ms** | **20.28 ms** | **38.40 ms** | **5.64 s** | **2.06x** |
 
-**Key Takeaways**:
-- **51.6% reduction in GPU prefill compute cycles** (from 11.65s down to 5.64s).
-- **2.06x speedup** on Time-To-First-Token (TTFT).
-- **Cluster KV Hit Rate improved from 68.7% to 86.6%** without sacrificing worker load balance.
+Observed performance characteristics:
+- 51.6% reduction in aggregate GPU prefill compute cycles.
+- 2.06x mean TTFT speedup under identical concurrency constraints.
+- Effective suppression of cache thrashing without hot-spotting individual replicas.
 
 ---
 
-## 🚀 Quickstart
+## Features
 
-### 1. Build & Run Tests
+- **Compressed Radix Tree**: Token block sequences are indexed using an adaptive radix trie with $\mathcal{O}(L)$ prefix lookup complexity, where $L$ is the prompt block depth.
+- **Zero-Allocation Token Chunking**: Fast rolling XXH3 64-bit hashing across configurable block windows (default: 64 tokens, configurable for Anthropic 1,024-token breakpoints).
+- **Shadow LRU Cache Tracking**: Tracks GPU memory capacity limits per worker and simulates LRU eviction to prevent routing against stale prefixes.
+- **Dual API Compatibility**: Native endpoint support for both Anthropic (`/v1/messages`) and OpenAI (`/v1/chat/completions`) schemas.
+- **Zero-Copy Streaming**: Pass-through Server-Sent Events (`text/event-stream`) streaming with injected telemetry headers (`X-Radix-Worker`, `X-Radix-Matched-Blocks`, `X-Radix-Hit-Ratio`).
+- **Telemetry & Metrics**: Built-in Prometheus-compatible runtime metrics (`/metrics`) and health checks (`/health`).
+
+---
+
+## Installation & Build
+
+Requires Rust 1.80+.
+
+```bash
+git clone https://github.com/SamGanYX/radix-gate.git
+cd radix-gate
+cargo build --release
+```
+
+Run test suite:
 ```bash
 cargo test
 ```
 
-### 2. Run the Benchmark Simulator
+---
+
+## Usage
+
+### 1. Run Benchmark Suite
+
 ```bash
 cargo run --release -- bench --workers 4 --requests 1000 --kv-blocks 150 --agents 20
 ```
 
-### 3. Start the Gateway Proxy
+Available flags:
+- `--workers <COUNT>`: Number of simulated worker replicas (default: `4`).
+- `--requests <COUNT>`: Number of requests in trace (default: `800`).
+- `--kv-blocks <COUNT>`: Worker KV memory capacity in blocks (default: `500`).
+- `--agents <COUNT>`: Number of distinct template personas (default: `6`).
+- `--block-size <TOKENS>`: Token chunk granularity (default: `64`).
+
+### 2. Run Proxy Server
+
+Start with mock workers (standalone verification):
 ```bash
-cargo run --release -- serve --host 127.0.0.1 --port 8080 --mock-workers 4
+cargo run --release -- serve --port 8080 --mock-workers 4
 ```
 
-### 4. Query with Anthropic or OpenAI API Schemas
-
-**Anthropic Messages API:**
+Start with live upstream replicas:
 ```bash
-curl -X POST http://127.0.0.1:8080/v1/messages \
+cargo run --release -- serve --port 8080 --upstreams "http://10.0.0.1:8000,http://10.0.0.2:8000"
+```
+
+### 3. Send Requests
+
+#### Anthropic Messages API
+```bash
+curl -X POST http://localhost:8080/v1/messages \
   -H "Content-Type: application/json" \
   -d '{
     "model": "claude-3-5-sonnet-20241022",
-    "system": "You are a senior inference infrastructure engineer.",
+    "system": "You are a database optimization engine.",
     "messages": [
-      {"role": "user", "content": "How does Radix routing optimize KV cache hits?"}
+      {"role": "user", "content": "Explain index selectivity."}
     ]
   }'
 ```
 
-**Inspect Live Cluster & Radix Tree Metrics:**
+#### OpenAI Chat Completions API
 ```bash
-curl http://127.0.0.1:8080/metrics
+curl -X POST http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gpt-4o",
+    "messages": [
+      {"role": "system", "content": "You are a code reviewer."},
+      {"role": "user", "content": "Review this patch."}
+    ]
+  }'
+```
+
+#### Telemetry
+```bash
+curl http://localhost:8080/metrics
+```
+
+Response includes trie node count, cache hit ratio, active worker distribution, and per-worker utilization:
+```json
+{
+  "performance": {
+    "cluster_cache_hit_ratio": "86.60%",
+    "total_matched_blocks": 15420,
+    "total_prompt_blocks": 17800,
+    "total_requests": 1000
+  },
+  "radix_tree": {
+    "total_nodes": 42,
+    "unique_workers": 4
+  },
+  "status": "healthy"
+}
 ```
 
 ---
 
-## 🛠️ Codebase Structure
+## Architecture Details
 
-- `src/trie/`: Compact Radix Tree data structure for 64-bit token block hash prefix matching.
-- `src/tokenizer.rs`: Deterministic XXH3 rolling chunker (64-token / 1024-token windows).
-- `src/balancer/`: Multi-objective affinity + queue penalty routing algorithms.
-- `src/shadow_cache/`: Worker replica KV capacity tracking and shadow LRU eviction.
-- `src/proxy/`: Axum async streaming reverse proxy with OpenAI & Anthropic compatibility.
-- `src/simulator/`: Realistic distributed inference simulation harness with PagedAttention hardware physics.
+- `src/trie/`: Radix tree implementation with branch splitting and node pruning.
+- `src/tokenizer.rs`: Deterministic token block hasher using XXH3-64.
+- `src/balancer/`: Multi-objective routing policies (`PrefixAware`, `RoundRobin`, `LeastLoaded`).
+- `src/shadow_cache/`: Worker capacity tracker and LRU state mirror.
+- `src/proxy/`: Axum-based HTTP proxy, request parser, and telemetry decorator.
+- `src/simulator/`: Discrete event benchmark harness with prefill/decode latency model.
 
 ---
 
-## 📚 References & Background Reading
-- [Anthropic: Prompt Caching with Claude](https://www.anthropic.com/news/prompt-caching)
-- [Anthropic Research: Effective Context Engineering for AI Agents](https://www.anthropic.com/research/effective-context-engineering-for-ai-agents)
-- [SGLang: Efficient Execution of Structured Language Models (RadixAttention)](https://arxiv.org/abs/2312.07104)
-- [vLLM: Efficient Memory Management for Large Language Model Serving with PagedAttention](https://arxiv.org/abs/2309.06180)
+## References
+
+1. Anthropic. (2024). *Prompt Caching with Claude*. https://www.anthropic.com/news/prompt-caching
+2. Kwon, W., et al. (2023). *Efficient Memory Management for Large Language Model Serving with PagedAttention*. SOSP 2023. https://arxiv.org/abs/2309.06180
+3. Zheng, L., et al. (2023). *SGLang: Efficient Execution of Structured Language Models with RadixAttention*. https://arxiv.org/abs/2312.07104
 
 ---
 
 ## License
+
 Apache-2.0
