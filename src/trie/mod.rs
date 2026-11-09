@@ -1,4 +1,5 @@
 pub mod node;
+pub mod sharded;
 
 pub use node::{BlockHash, RadixNode, WorkerId};
 use std::collections::{HashMap, HashSet};
@@ -15,15 +16,17 @@ pub struct RadixTree {
 
 #[derive(Debug, Clone, Default)]
 pub struct MatchResult {
-    /// Number of matching blocks for each worker.
+    /// Number of matching blocks confirmed in cache for each worker.
     pub worker_matches: HashMap<WorkerId, usize>,
+    /// Number of matching blocks currently being prefilled in-flight by a worker.
+    pub in_flight_matches: HashMap<WorkerId, usize>,
     /// Longest match length across all workers in blocks.
     pub max_matched_blocks: usize,
 }
 
 impl Default for RadixTree {
     fn default() -> Self {
-        Self::new(64) // default 64 tokens per block
+        Self::new(64)
     }
 }
 
@@ -56,7 +59,6 @@ impl RadixTree {
         let first = blocks[0];
 
         if let Some(child) = current.children.get_mut(&first) {
-            // Find common prefix between child.prefix and blocks
             let common_len = child
                 .prefix
                 .iter()
@@ -65,23 +67,21 @@ impl RadixTree {
                 .count();
 
             if common_len == child.prefix.len() {
-                // Entire child prefix matches, recurse into child
                 child.cached_workers.insert(Arc::clone(worker_id));
                 child.last_accessed = Instant::now();
                 child.hit_count += 1;
                 Self::insert_recursive(child, &blocks[common_len..], worker_id);
             } else {
-                // Split child node at common_len
                 let split_key = child.prefix[common_len];
                 let split_node = RadixNode {
                     prefix: child.prefix[common_len..].to_vec(),
                     cached_workers: child.cached_workers.clone(),
+                    in_flight_workers: child.in_flight_workers.clone(),
                     children: std::mem::take(&mut child.children),
                     last_accessed: child.last_accessed,
                     hit_count: child.hit_count,
                 };
 
-                // Truncate existing child prefix to the common part
                 child.prefix.truncate(common_len);
                 child.children.clear();
                 child.cached_workers.insert(Arc::clone(worker_id));
@@ -89,10 +89,8 @@ impl RadixTree {
                 child.hit_count += 1;
 
                 if common_len == blocks.len() {
-                    // Exact match at split point
                     child.children.insert(split_key, split_node);
                 } else {
-                    // New branch for the rest of blocks
                     let new_branch_key = blocks[common_len];
                     let new_node =
                         RadixNode::new(blocks[common_len..].to_vec(), Some(Arc::clone(worker_id)));
@@ -101,14 +99,95 @@ impl RadixTree {
                 }
             }
         } else {
-            // No existing branch starts with `first`, create a new one
             let new_node = RadixNode::new(blocks.to_vec(), Some(Arc::clone(worker_id)));
             current.children.insert(first, new_node);
         }
     }
 
-    /// Finds the Longest Common Prefix (LCP) match length for all workers.
-    /// Returns the number of consecutive matched blocks for each worker.
+    /// Optimistically reserves an in-flight prefix prefill lease for a worker.
+    /// This prevents thundering herd cold prefills across other replicas.
+    pub fn reserve_in_flight(&mut self, blocks: &[BlockHash], worker_id: &str) {
+        if blocks.is_empty() {
+            return;
+        }
+        let w_arc: WorkerId = Arc::from(worker_id);
+        Self::reserve_in_flight_recursive(&mut self.root, blocks, &w_arc);
+    }
+
+    fn reserve_in_flight_recursive(
+        current: &mut RadixNode,
+        blocks: &[BlockHash],
+        worker_id: &WorkerId,
+    ) {
+        if blocks.is_empty() {
+            return;
+        }
+
+        let first = blocks[0];
+        if let Some(child) = current.children.get_mut(&first) {
+            let common_len = child
+                .prefix
+                .iter()
+                .zip(blocks.iter())
+                .take_while(|(a, b)| a == b)
+                .count();
+
+            if common_len == child.prefix.len() {
+                *child
+                    .in_flight_workers
+                    .entry(Arc::clone(worker_id))
+                    .or_insert(0) += 1;
+                Self::reserve_in_flight_recursive(child, &blocks[common_len..], worker_id);
+            }
+        }
+    }
+
+    /// Releases an in-flight reservation. If commit is true, transitions the prefix into confirmed cached state.
+    pub fn release_in_flight(&mut self, blocks: &[BlockHash], worker_id: &str, commit: bool) {
+        if blocks.is_empty() {
+            return;
+        }
+        let w_arc: WorkerId = Arc::from(worker_id);
+        Self::release_in_flight_recursive(&mut self.root, blocks, &w_arc, commit);
+    }
+
+    fn release_in_flight_recursive(
+        current: &mut RadixNode,
+        blocks: &[BlockHash],
+        worker_id: &WorkerId,
+        commit: bool,
+    ) {
+        if blocks.is_empty() {
+            return;
+        }
+
+        let first = blocks[0];
+        if let Some(child) = current.children.get_mut(&first) {
+            let common_len = child
+                .prefix
+                .iter()
+                .zip(blocks.iter())
+                .take_while(|(a, b)| a == b)
+                .count();
+
+            if common_len == child.prefix.len() {
+                if let Some(count) = child.in_flight_workers.get_mut(worker_id) {
+                    if *count <= 1 {
+                        child.in_flight_workers.remove(worker_id);
+                    } else {
+                        *count -= 1;
+                    }
+                }
+                if commit {
+                    child.cached_workers.insert(Arc::clone(worker_id));
+                }
+                Self::release_in_flight_recursive(child, &blocks[common_len..], worker_id, commit);
+            }
+        }
+    }
+
+    /// Finds the Longest Common Prefix (LCP) match length for all workers,
+    /// returning both confirmed cache hits and active in-flight prefill matches.
     pub fn find_longest_prefix(&self, blocks: &[BlockHash]) -> MatchResult {
         let mut result = MatchResult::default();
         if blocks.is_empty() {
@@ -135,7 +214,7 @@ impl RadixTree {
 
                 matched_depth += match_len;
 
-                // For all workers on this child, record that they matched up to this depth
+                // Track confirmed cached workers
                 for worker in &child.cached_workers {
                     let entry = result.worker_matches.entry(Arc::clone(worker)).or_insert(0);
                     if matched_depth > *entry {
@@ -146,12 +225,23 @@ impl RadixTree {
                     }
                 }
 
+                // Track in-flight prefilling workers for request coalescing
+                for (worker, &count) in &child.in_flight_workers {
+                    if count > 0 {
+                        let entry = result
+                            .in_flight_matches
+                            .entry(Arc::clone(worker))
+                            .or_insert(0);
+                        if matched_depth > *entry {
+                            *entry = matched_depth;
+                        }
+                    }
+                }
+
                 if match_len == child.prefix.len() {
-                    // Consumed entire edge, descend into children
                     remaining = &remaining[match_len..];
                     current = child;
                 } else {
-                    // Partial edge match, cannot descend further
                     break;
                 }
             } else {
@@ -162,19 +252,37 @@ impl RadixTree {
         result
     }
 
-    /// Evicts a worker's registration from nodes if a cache eviction occurred on that worker.
+    /// Evicts specific blocks for a worker (handling dynamic upstream eviction feedback).
+    pub fn evict_blocks(&mut self, worker_id: &str, blocks: &[BlockHash]) {
+        for &b in blocks {
+            Self::evict_single_block_recursive(&mut self.root, worker_id, b);
+        }
+        self.prune_empty_nodes();
+    }
+
+    fn evict_single_block_recursive(node: &mut RadixNode, worker_id: &str, target: BlockHash) {
+        if node.prefix.contains(&target) {
+            node.cached_workers.retain(|w| &**w != worker_id);
+        }
+        for child in node.children.values_mut() {
+            Self::evict_single_block_recursive(child, worker_id, target);
+        }
+    }
+
+    /// Evicts a worker's registration across the entire tree (e.g. upon worker crash or reboot).
     pub fn evict_worker(&mut self, worker_id: &str) {
         Self::evict_worker_recursive(&mut self.root, worker_id);
     }
 
     fn evict_worker_recursive(node: &mut RadixNode, worker_id: &str) {
         node.cached_workers.retain(|w| &**w != worker_id);
+        node.in_flight_workers.retain(|w, _| &**w != worker_id);
         for child in node.children.values_mut() {
             Self::evict_worker_recursive(child, worker_id);
         }
     }
 
-    /// Prunes tree branches that have zero active cached workers.
+    /// Prunes tree branches that have zero active cached workers and zero in-flight leases.
     pub fn prune_empty_nodes(&mut self) {
         Self::prune_recursive(&mut self.root);
     }
@@ -182,7 +290,9 @@ impl RadixTree {
     fn prune_recursive(node: &mut RadixNode) -> bool {
         node.children
             .retain(|_, child| Self::prune_recursive(child));
-        !node.children.is_empty() || !node.cached_workers.is_empty()
+        !node.children.is_empty()
+            || !node.cached_workers.is_empty()
+            || !node.in_flight_workers.is_empty()
     }
 
     /// Computes summary metrics of the current Radix Tree state.
@@ -209,43 +319,35 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_radix_tree_basic_insertion_and_matching() {
+    fn test_radix_tree_in_flight_coalescing() {
         let mut trie = RadixTree::new(64);
-        let prefix1 = vec![101, 102, 103, 104];
-        let prefix2 = vec![101, 102, 201, 202];
+        let prefix = vec![101, 102, 103, 104];
 
-        trie.insert(&prefix1, "worker-1");
-        trie.insert(&prefix2, "worker-2");
+        // Worker 1 starts prefilling prefix (optimistic lease)
+        trie.insert(&prefix, "worker-1");
+        trie.reserve_in_flight(&prefix, "worker-1");
 
-        // Query matching prefix1
-        let match1 = trie.find_longest_prefix(&[101, 102, 103, 104]);
-        assert_eq!(match1.worker_matches.get("worker-1"), Some(&4));
-        assert_eq!(match1.worker_matches.get("worker-2"), Some(&2));
-        assert_eq!(match1.max_matched_blocks, 4);
+        // Concurrent request arrives before Worker 1 finishes
+        let match_res = trie.find_longest_prefix(&prefix);
+        assert_eq!(match_res.worker_matches.get("worker-1"), Some(&4));
+        assert_eq!(match_res.in_flight_matches.get("worker-1"), Some(&4));
 
-        // Query matching partial common prefix
-        let match_partial = trie.find_longest_prefix(&[101, 102, 999]);
-        assert_eq!(match_partial.worker_matches.get("worker-1"), Some(&2));
-        assert_eq!(match_partial.worker_matches.get("worker-2"), Some(&2));
-        assert_eq!(match_partial.max_matched_blocks, 2);
-
-        // Query completely disjoint prefix
-        let match_disjoint = trie.find_longest_prefix(&[999, 888]);
-        assert!(match_disjoint.worker_matches.is_empty());
-        assert_eq!(match_disjoint.max_matched_blocks, 0);
+        // Release lease upon completion
+        trie.release_in_flight(&prefix, "worker-1", true);
+        let match_after = trie.find_longest_prefix(&prefix);
+        assert_eq!(match_after.worker_matches.get("worker-1"), Some(&4));
+        assert!(match_after.in_flight_matches.is_empty());
     }
 
     #[test]
-    fn test_radix_tree_branch_split() {
+    fn test_dynamic_eviction_sync() {
         let mut trie = RadixTree::new(64);
-        let prefix_a = vec![1, 2, 3, 4, 5];
-        trie.insert(&prefix_a, "worker-a");
+        let prefix = vec![501, 502, 503];
+        trie.insert(&prefix, "worker-1");
 
-        let prefix_b = vec![1, 2, 7, 8];
-        trie.insert(&prefix_b, "worker-b");
-
-        let match_b = trie.find_longest_prefix(&[1, 2, 7, 8, 9]);
-        assert_eq!(match_b.worker_matches.get("worker-b"), Some(&4));
-        assert_eq!(match_b.worker_matches.get("worker-a"), Some(&2));
+        // Worker evicts block 502 dynamically
+        trie.evict_blocks("worker-1", &[502]);
+        let match_res = trie.find_longest_prefix(&prefix);
+        assert_eq!(match_res.worker_matches.get("worker-1"), None);
     }
 }

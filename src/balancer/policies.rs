@@ -57,12 +57,20 @@ impl RoutingPolicy for PrefixAwarePolicy {
                 continue;
             }
 
-            let matched = match_result
+            let confirmed_matched = match_result
                 .worker_matches
                 .get(id.as_str())
                 .copied()
                 .unwrap_or(0);
-            let cache_affinity = matched as f64 / total_blocks as f64;
+            let in_flight_matched = match_result
+                .in_flight_matches
+                .get(id.as_str())
+                .copied()
+                .unwrap_or(0);
+
+            // In-flight warming prefill is given 90% weight of confirmed cache hit to coalesce thundering herds
+            let effective_matched = confirmed_matched as f64 + (0.90 * in_flight_matched as f64);
+            let cache_affinity = effective_matched / total_blocks as f64;
             let load_factor = worker.load_factor();
 
             // Multi-objective score: reward warm KV cache, penalize overloaded workers
@@ -72,7 +80,7 @@ impl RoutingPolicy for PrefixAwarePolicy {
                 best_score = score;
                 best_worker_id = Some(id.clone());
                 best_endpoint = worker.endpoint_url.clone();
-                best_matched_blocks = matched;
+                best_matched_blocks = confirmed_matched;
             }
         }
 
