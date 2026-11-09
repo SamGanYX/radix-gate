@@ -1,25 +1,48 @@
 use crate::trie::BlockHash;
+use tiktoken_rs::{CoreBPE, cl100k_base};
 use xxhash_rust::xxh3::{Xxh3, xxh3_64};
 
 /// Utility for chunking text and prompt messages into deterministic 64-bit block hashes.
-#[derive(Debug, Clone)]
+/// Supports both exact BPE token-level chunking and fast byte streaming.
+#[derive(Clone)]
 pub struct BlockChunker {
-    /// Number of tokens (or word-approximations) per KV block.
+    /// Number of tokens per KV block (e.g., 64 for PagedAttention, 1024 for Anthropic breakpoints).
     pub block_size: usize,
+    /// Core BPE tokenizer instance (lazy/cached).
+    bpe: Option<CoreBPE>,
+}
+
+impl std::fmt::Debug for BlockChunker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BlockChunker")
+            .field("block_size", &self.block_size)
+            .field("bpe_enabled", &self.bpe.is_some())
+            .finish()
+    }
 }
 
 impl Default for BlockChunker {
     fn default() -> Self {
-        Self { block_size: 64 }
+        Self::new(64)
     }
 }
 
 impl BlockChunker {
+    /// Creates a new chunker with BPE tokenization initialized.
     pub fn new(block_size: usize) -> Self {
-        Self { block_size }
+        let bpe = cl100k_base().ok();
+        Self { block_size, bpe }
     }
 
-    /// Chunks a raw sequence of token IDs into 64-bit block hashes.
+    /// Creates a lightweight chunker without BPE (fast word-slice approximation).
+    pub fn new_fast(block_size: usize) -> Self {
+        Self {
+            block_size,
+            bpe: None,
+        }
+    }
+
+    /// Chunks a raw sequence of u32 token IDs into deterministic 64-bit block hashes.
     pub fn chunk_tokens(&self, tokens: &[u32]) -> Vec<BlockHash> {
         tokens
             .chunks(self.block_size)
@@ -30,9 +53,19 @@ impl BlockChunker {
             .collect()
     }
 
-    /// Fast, zero-allocation chunker for string prompts.
-    /// Streams word byte slices directly into XXH3 without intermediate String allocations.
+    /// Chunks text using exact BPE tokenization (byte-for-byte identical to model input).
+    /// If BPE tokenizer is available, produces exact token block hashes; otherwise falls back to fast stream.
     pub fn chunk_text(&self, text: &str) -> Vec<BlockHash> {
+        if let Some(ref bpe) = self.bpe {
+            let tokens = bpe.encode_with_special_tokens(text);
+            self.chunk_tokens(&tokens)
+        } else {
+            self.chunk_text_fast(text)
+        }
+    }
+
+    /// Fast zero-allocation fallback chunker without BPE overhead.
+    pub fn chunk_text_fast(&self, text: &str) -> Vec<BlockHash> {
         let words: Vec<&str> = text.split_whitespace().collect();
         if words.is_empty() {
             return Vec::new();
@@ -53,7 +86,7 @@ impl BlockChunker {
             .collect()
     }
 
-    /// Combines multiple role-based messages (system, user, assistant) into a canonical prefix.
+    /// Combines multiple role-based messages into a canonical prompt prefix and chunks it.
     pub fn chunk_messages(&self, messages: &[(&str, &str)]) -> Vec<BlockHash> {
         let mut full_repr = String::new();
         for (role, content) in messages {
@@ -68,7 +101,6 @@ impl BlockChunker {
 }
 
 fn bytemuck_or_slice_u32_to_bytes(slice: &[u32]) -> &[u8] {
-    // Safe alignment-preserving cast of u32 slice to byte slice
     unsafe { std::slice::from_raw_parts(slice.as_ptr() as *const u8, std::mem::size_of_val(slice)) }
 }
 
@@ -77,13 +109,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_chunker_deterministic() {
+    fn test_bpe_exact_token_chunking() {
         let chunker = BlockChunker::new(4);
-        let text = "You are a helpful coding assistant specialized in high performance distributed systems and ML inference.";
-        let hashes1 = chunker.chunk_text(text);
-        let hashes2 = chunker.chunk_text(text);
+        let prompt = "Anthropic prompt caching reduces prefill latency.";
+        let hashes = chunker.chunk_text(prompt);
+        assert!(!hashes.is_empty());
 
-        assert!(!hashes1.is_empty());
-        assert_eq!(hashes1, hashes2);
+        // Repeated chunking must be deterministic
+        let hashes_repeat = chunker.chunk_text(prompt);
+        assert_eq!(hashes, hashes_repeat);
     }
 }
