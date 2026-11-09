@@ -177,13 +177,41 @@ Response includes trie node count, cache hit ratio, active worker distribution, 
 
 ---
 
+## Distributed Systems Design & Edge-Case Handling
+
+### 1. Thundering Herd Suppression via In-Flight Prefill Leases
+In bursty multi-agent workflows, multiple concurrent requests sharing a previously unseen prefix frequently arrive within the same millisecond window. A naive prefix router registers prefixes only *after* request completion, which causes all subsequent concurrent requests to miss and scatter across independent workers—triggering $N$ redundant cold prefills.
+
+RadixGate solves this through **Optimistic In-Flight Prefill Leases**:
+- When Request 1 is dispatched to worker $W_i$, an in-flight reservation lease is recorded along the trie branch.
+- When Requests 2 through $K$ arrive while Request 1 is still computing, the router scores $W_i$'s in-flight warming prefix at 90% weighting of a confirmed hit.
+- The router coalesces the burst by queueing subsequent requests behind $W_i$. When Request 1 finishes, Requests 2 through $K$ execute against a 100% warm KV cache.
+
+### 2. Active Eviction Synchronization vs. Shadow Drift
+Physical GPU workers dynamically evict prefix blocks when output token generation surges or memory is preempted. A purely passive gateway shadow cache inevitably drifts from physical VRAM reality, leading to **cache hallucination** (routing requests expecting hits that are cold on the GPU).
+
+RadixGate provides bi-directional eviction synchronization:
+- **Upstream Response Trailers**: Workers emit `X-Evicted-Blocks: <hash_csv>` on completions when blocks are dropped.
+- **Dedicated Sync Ingress**: Upstream engines broadcast asynchronous eviction receipts directly to `POST /v1/cache/sync`.
+- The gateway immediately prunes evicted block hashes from the trie, ensuring state fidelity.
+
+### 3. Exact BPE Token Boundary Alignment
+Word-level or naive character chunking fails in production because Byte-Pair Encoding (BPE) is non-associative across arbitrary string boundaries. If the gateway hashes text approximations rather than exact BPE token sequences, the generated 64-bit block hashes will not match the upstream engine's PagedAttention block keys.
+
+RadixGate integrates `tiktoken-rs` (`cl100k_base`), chunking directly over canonical u32 token IDs on exact token boundaries (e.g. 64-token PagedAttention blocks or 1,024-token Anthropic cache breakpoints).
+
+### 4. Partitioned Concurrency (Sharded Radix Trie)
+Under high concurrency, acquiring a global write lock on a central trie for every request completion creates severe CPU contention. RadixGate provides `ShardedRadixTree`, which partitions the trie into $N$ independent shards indexed by a 64-bit mixer hash of the prompt's root token block. Requests with distinct prefixes operate in parallel across independent `RwLock` shards without lock contention.
+
+---
+
 ## Architecture Details
 
-- `src/trie/`: Radix tree implementation with branch splitting and node pruning.
-- `src/tokenizer.rs`: Deterministic token block hasher using XXH3-64.
+- `src/trie/`: Radix tree implementation with branch splitting, in-flight leases, and sharded partitioning (`ShardedRadixTree`).
+- `src/tokenizer.rs`: Exact BPE token chunker (`tiktoken-rs`) and zero-allocation streaming fallback.
 - `src/balancer/`: Multi-objective routing policies (`PrefixAware`, `RoundRobin`, `LeastLoaded`).
-- `src/shadow_cache/`: Worker capacity tracker and LRU state mirror.
-- `src/proxy/`: Axum-based HTTP proxy, request parser, and telemetry decorator.
+- `src/shadow_cache/`: Worker capacity tracker and O(1) doubly-linked list LRU state mirror.
+- `src/proxy/`: Axum-based HTTP proxy, request parser, cache sync handler, and telemetry decorator.
 - `src/simulator/`: Discrete event benchmark harness with prefill/decode latency model.
 
 ---
