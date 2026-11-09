@@ -6,6 +6,7 @@ use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Json, Response};
 use parking_lot::RwLock;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tracing::{info, warn};
 
@@ -14,7 +15,7 @@ use crate::balancer::policies::PrefixAwarePolicy;
 use crate::proxy::types::ChatRequest;
 use crate::shadow_cache::WorkerPool;
 use crate::tokenizer::BlockChunker;
-use crate::trie::RadixTree;
+use crate::trie::{BlockHash, RadixTree};
 
 /// Shared application state across the async Axum web server.
 pub struct AppState {
@@ -56,6 +57,34 @@ impl AppState {
 /// Health check endpoint.
 pub async fn health() -> impl IntoResponse {
     Json(json!({ "status": "ok", "service": "radix-gate" }))
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct CacheSyncPayload {
+    pub worker_id: String,
+    pub evicted_blocks: Vec<BlockHash>,
+}
+
+/// Active worker feedback endpoint: allows upstream engines (vLLM / Triton)
+/// to broadcast dynamic VRAM cache evictions directly to the gateway.
+pub async fn handle_cache_sync(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<CacheSyncPayload>,
+) -> impl IntoResponse {
+    info!(
+        worker = %payload.worker_id,
+        evicted = payload.evicted_blocks.len(),
+        "Received upstream cache eviction sync"
+    );
+
+    let mut tree = state.radix_tree.write();
+    tree.evict_blocks(&payload.worker_id, &payload.evicted_blocks);
+
+    Json(json!({
+        "status": "synchronized",
+        "worker_id": payload.worker_id,
+        "evicted_blocks_purged": payload.evicted_blocks.len(),
+    }))
 }
 
 /// Global cluster and Radix Tree metrics endpoint.
@@ -174,7 +203,7 @@ async fn handle_routing(
         .total_prompt_blocks
         .fetch_add(total_blocks as u64, Ordering::Relaxed);
 
-    // 3. Increment active load on selected worker
+    // 3. Increment active load on selected worker and acquire optimistic in-flight prefill lease
     let worker_arc = match state.worker_pool.get_worker(&decision.worker_id) {
         Some(w) => w,
         None => {
@@ -193,16 +222,20 @@ async fn handle_routing(
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
 
+    // Optimistically reserve prefix in trie to prevent concurrent thundering-herd cold prefills
+    {
+        let mut tree = state.radix_tree.write();
+        tree.reserve_in_flight(&block_hashes, &decision.worker_id);
+    }
+
     // 4. Update shadow cache and Radix Tree with newly cached blocks
     {
         let mut worker = worker_arc.write();
         let evicted = worker.record_request(&block_hashes, decision.matched_blocks);
 
-        // Update Radix Tree
         let mut tree = state.radix_tree.write();
         tree.insert(&block_hashes, &decision.worker_id);
 
-        // If shadow cache had evictions, update trie
         if !evicted.is_empty() {
             tree.prune_empty_nodes();
         }
@@ -243,9 +276,32 @@ async fn handle_routing(
 
     // 6. Return live response if upstream succeeded, else return high-fidelity mock
     let mut response = match live_response {
-        Some(resp) => resp,
+        Some(resp) => {
+            // Check for upstream dynamic eviction header feedback
+            if let Some(evicted_str) = resp
+                .headers()
+                .get("x-evicted-blocks")
+                .and_then(|h| h.to_str().ok())
+            {
+                let blocks: Vec<BlockHash> = evicted_str
+                    .split(',')
+                    .filter_map(|s| s.trim().parse::<u64>().ok())
+                    .collect();
+                if !blocks.is_empty() {
+                    let mut tree = state.radix_tree.write();
+                    tree.evict_blocks(&decision.worker_id, &blocks);
+                }
+            }
+            resp
+        }
         None => build_mock_response(&state, &payload, &decision, is_anthropic),
     };
+
+    // Release in-flight reservation lease and transition prefix to confirmed state
+    {
+        let mut tree = state.radix_tree.write();
+        tree.release_in_flight(&block_hashes, &decision.worker_id, true);
+    }
 
     // Inject Radix Gateway telemetry headers
     let headers_mut = response.headers_mut();
@@ -289,7 +345,6 @@ async fn try_forward_upstream(
 
     let mut req_builder = client.post(&target_url).json(payload);
 
-    // Forward auth headers if present
     if let Some(auth) = client_headers.get("authorization") {
         req_builder = req_builder.header("authorization", auth);
     }
@@ -311,7 +366,6 @@ async fn try_forward_upstream(
                 .unwrap_or("application/json")
                 .to_string();
 
-            // Stream response if SSE or streaming body
             let body = Body::from_stream(upstream_resp.bytes_stream());
             let response = Response::builder()
                 .status(status)
