@@ -272,15 +272,27 @@ RadixGate implements **Power-of-Two-Choices with Prefix Bias (P2C-Prefix)** (`Po
 - Evaluates composite scores balancing normalized prefix length against queued in-flight requests.
 - Applies a hard load ceiling ($c \cdot \bar{L}$, where $\bar{L}$ is average cluster load). If a candidate exceeds the bounded load ceiling, the router spills traffic to an underloaded alternative, bounding maximum queue delay to $\mathcal{O}(\log \log N)$ while maintaining high prefix hit rates.
 
+### 6. Circuit Breaking, Automatic Failover, and Active Health Probing
+If an upstream GPU worker panics or its host machine crashes, naive routers black-hole client traffic because the dead worker still appears to hold cached prefixes.
+
+RadixGate integrates automated fault tolerance:
+- **Immediate Failover Retry**: When an upstream request fails (socket drop, connection timeout, 5xx), the gateway catches the failure, increments the worker's failure counter, and immediately fails over to the next healthy candidate in the cluster rather than failing the client request.
+- **Circuit Breaker Tripping**: After 3 consecutive upstream failures, the worker's circuit breaker trips (`is_healthy = false`). The router instantly purges the worker's leaf nodes from the Radix Tree so subsequent queries are not misrouted.
+- **Strict 502 Handling**: If all healthy upstreams are exhausted, the gateway returns a standard `HTTP 502 Bad Gateway` JSON error—never a synthetic mock string.
+- **Background Health Recovery Loop**: A background task periodically probes `{worker}/health`. When an offline worker restarts and returns `200 OK`, it is automatically marked healthy and admitted back into the load-balancing pool.
+
+### 7. Early Prefix Cutoff (Gateway CPU Protection)
+Full BPE tokenization over massive prompts (50k+ tokens) on the gateway hot path introduces multi-millisecond CPU delays. RadixGate enforces an early prefix cutoff (`max_prefix_tokens: 4096`), slicing long prompt strings at clean whitespace boundaries and tokenizing only the prefix depth necessary for cluster routing decisions. Unchunked trailing tokens remain untouched for pass-through to the upstream model, preventing gateway CPU saturation at high QPS.
+
 ---
 
 ## Architecture Details
 
-- `src/trie/`: Radix tree implementation with branch splitting, in-flight leases, ASCII visualization, and sharded partitioning (`ShardedRadixTree`).
-- `src/tokenizer.rs`: Exact BPE token chunker (`tiktoken-rs`) and zero-allocation streaming fallback.
+- `src/trie/`: Radix tree implementation with branch splitting, atomic in-flight commit, ASCII visualizer, and sharded partitioning (`ShardedRadixTree`).
+- `src/tokenizer.rs`: BPE token chunker (`tiktoken-rs`) with early prefix cutoff and sub-block residual hashing.
 - `src/balancer/`: Multi-objective routing policies (`PrefixAware`, `PowerOfTwoChoices`, `RoundRobin`, `LeastLoaded`).
-- `src/shadow_cache/`: Worker capacity tracker and O(1) doubly-linked list LRU state mirror.
-- `src/proxy/`: Axum-based HTTP proxy, Prometheus OpenMetrics exporter, cache sync ingress, and telemetry decorator.
+- `src/shadow_cache/`: Worker capacity tracker, circuit breaker state, and O(1) doubly-linked list LRU state mirror.
+- `src/proxy/`: Axum-based HTTP proxy, Prometheus OpenMetrics exporter, automatic failover retries, background health prober, and cache sync ingress.
 - `src/load_test.rs`: High-concurrency async socket load generator and percentile latency analyzer.
 - `src/simulator/`: Discrete event benchmark harness with prefill/decode latency model.
 
