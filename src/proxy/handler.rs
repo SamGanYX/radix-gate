@@ -88,7 +88,11 @@ pub async fn handle_cache_sync(
 }
 
 /// Global cluster and Radix Tree metrics endpoint.
-pub async fn metrics(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+/// Returns standard Prometheus text format by default (or JSON if Accept: application/json).
+pub async fn metrics(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Response {
     let (nodes, active_workers) = {
         let tree = state.radix_tree.read();
         tree.stats()
@@ -105,36 +109,94 @@ pub async fn metrics(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     };
 
     let worker_ids = state.worker_pool.get_worker_ids();
-    let mut workers_summary = Vec::new();
-    for id in &worker_ids {
-        if let Some(w_lock) = state.worker_pool.get_worker(id) {
-            let w = w_lock.read();
-            workers_summary.push(json!({
-                "id": w.id,
-                "endpoint": w.endpoint_url,
-                "load": w.load(),
-                "cache_utilization": format!("{:.1}%", w.cache_utilization() * 100.0),
-                "total_routed": w.total_requests_routed,
-                "matched_blocks": w.total_matched_blocks,
-                "prefilled_blocks": w.total_prefilled_blocks,
-            }));
-        }
-    }
+    let accept = headers
+        .get("accept")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
 
-    Json(json!({
-        "status": "healthy",
-        "radix_tree": {
-            "total_nodes": nodes,
-            "unique_workers": active_workers,
-        },
-        "performance": {
-            "total_requests": total_reqs,
-            "total_matched_blocks": matched_b,
-            "total_prompt_blocks": total_b,
-            "cluster_cache_hit_ratio": format!("{:.2}%", hit_ratio * 100.0),
-        },
-        "workers": workers_summary
-    }))
+    if accept.contains("application/json") {
+        let mut workers_summary = Vec::new();
+        for id in &worker_ids {
+            if let Some(w_lock) = state.worker_pool.get_worker(id) {
+                let w = w_lock.read();
+                workers_summary.push(json!({
+                    "id": w.id,
+                    "endpoint": w.endpoint_url,
+                    "load": w.load(),
+                    "cache_utilization": format!("{:.1}%", w.cache_utilization() * 100.0),
+                    "total_routed": w.total_requests_routed,
+                    "matched_blocks": w.total_matched_blocks,
+                    "prefilled_blocks": w.total_prefilled_blocks,
+                }));
+            }
+        }
+
+        Json(json!({
+            "status": "healthy",
+            "radix_tree": {
+                "total_nodes": nodes,
+                "unique_workers": active_workers,
+            },
+            "performance": {
+                "total_requests": total_reqs,
+                "total_matched_blocks": matched_b,
+                "total_prompt_blocks": total_b,
+                "cluster_cache_hit_ratio": format!("{:.2}%", hit_ratio * 100.0),
+            },
+            "workers": workers_summary
+        }))
+        .into_response()
+    } else {
+        // Prometheus / OpenMetrics text format
+        let mut prom = String::new();
+        prom.push_str("# HELP radixgate_requests_total Total number of routed inference requests\n");
+        prom.push_str("# TYPE radixgate_requests_total counter\n");
+        prom.push_str(&format!("radixgate_requests_total {}\n\n", total_reqs));
+
+        prom.push_str("# HELP radixgate_cache_hit_ratio Global cluster KV-cache prefix hit ratio\n");
+        prom.push_str("# TYPE radixgate_cache_hit_ratio gauge\n");
+        prom.push_str(&format!("radixgate_cache_hit_ratio {:.4}\n\n", hit_ratio));
+
+        prom.push_str("# HELP radixgate_matched_blocks_total Total token blocks matched across cache\n");
+        prom.push_str("# TYPE radixgate_matched_blocks_total counter\n");
+        prom.push_str(&format!("radixgate_matched_blocks_total {}\n\n", matched_b));
+
+        prom.push_str("# HELP radixgate_prompt_blocks_total Total prompt token blocks received\n");
+        prom.push_str("# TYPE radixgate_prompt_blocks_total counter\n");
+        prom.push_str(&format!("radixgate_prompt_blocks_total {}\n\n", total_b));
+
+        prom.push_str("# HELP radixgate_radix_tree_nodes Current number of nodes in Radix Tree\n");
+        prom.push_str("# TYPE radixgate_radix_tree_nodes gauge\n");
+        prom.push_str(&format!("radixgate_radix_tree_nodes {}\n\n", nodes));
+
+        prom.push_str("# HELP radixgate_worker_load Active in-flight requests per worker\n");
+        prom.push_str("# TYPE radixgate_worker_load gauge\n");
+        for id in &worker_ids {
+            if let Some(w_lock) = state.worker_pool.get_worker(id) {
+                let w = w_lock.read();
+                prom.push_str(&format!("radixgate_worker_load{{worker=\"{}\"}} {}\n", w.id, w.load()));
+            }
+        }
+        prom.push('\n');
+
+        prom.push_str("# HELP radixgate_worker_kv_utilization Ratio of GPU KV blocks utilized\n");
+        prom.push_str("# TYPE radixgate_worker_kv_utilization gauge\n");
+        for id in &worker_ids {
+            if let Some(w_lock) = state.worker_pool.get_worker(id) {
+                let w = w_lock.read();
+                prom.push_str(&format!(
+                    "radixgate_worker_kv_utilization{{worker=\"{}\"}} {:.4}\n",
+                    w.id,
+                    w.cache_utilization()
+                ));
+            }
+        }
+
+        Response::builder()
+            .header("content-type", "text/plain; version=0.0.4; charset=utf-8")
+            .body(Body::from(prom))
+            .unwrap_or_else(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Prometheus format error").into_response())
+    }
 }
 
 /// Primary OpenAI-compatible chat routing handler (`/v1/chat/completions`).
