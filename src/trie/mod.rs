@@ -151,6 +151,16 @@ impl RadixTree {
         Self::release_in_flight_recursive(&mut self.root, blocks, &w_arc, commit);
     }
 
+    /// Atomically commits prefix insertion and releases in-flight prefill leases in a single write pass.
+    pub fn commit_in_flight(&mut self, blocks: &[BlockHash], worker_id: &str) {
+        if blocks.is_empty() {
+            return;
+        }
+        self.insert(blocks, worker_id);
+        let w_arc: WorkerId = Arc::from(worker_id);
+        Self::release_in_flight_recursive(&mut self.root, blocks, &w_arc, false);
+    }
+
     fn release_in_flight_recursive(
         current: &mut RadixNode,
         blocks: &[BlockHash],

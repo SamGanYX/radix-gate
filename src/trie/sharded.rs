@@ -80,6 +80,16 @@ impl ShardedRadixTree {
         shard.release_in_flight(blocks, worker_id, commit);
     }
 
+    /// Atomically commits prefix insertion and releases in-flight leases on designated shard.
+    pub fn commit_in_flight(&self, blocks: &[BlockHash], worker_id: &str) {
+        if blocks.is_empty() {
+            return;
+        }
+        let idx = self.get_shard_idx(blocks);
+        let mut shard = self.shards[idx].write();
+        shard.commit_in_flight(blocks, worker_id);
+    }
+
     /// Broadcasts dynamic block eviction across all shards.
     pub fn evict_blocks(&self, worker_id: &str, blocks: &[BlockHash]) {
         for shard_lock in &self.shards {
