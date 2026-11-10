@@ -143,6 +143,8 @@ pub struct WorkerReplica {
     pub max_concurrency: usize,
     pub active_requests: AtomicUsize,
     pub is_healthy: bool,
+    pub consecutive_failures: usize,
+    pub circuit_breaker_threshold: usize,
 
     // High-performance O(1) shadow LRU cache state
     lru: FastLru,
@@ -167,11 +169,37 @@ impl WorkerReplica {
             max_concurrency,
             active_requests: AtomicUsize::new(0),
             is_healthy: true,
+            consecutive_failures: 0,
+            circuit_breaker_threshold: 3,
             lru: FastLru::new(),
             total_requests_routed: 0,
             total_matched_blocks: 0,
             total_prefilled_blocks: 0,
         }
+    }
+
+    /// Records a successful request, resetting consecutive failures.
+    pub fn record_success(&mut self) {
+        self.consecutive_failures = 0;
+        self.is_healthy = true;
+    }
+
+    /// Records a failed request. If consecutive failures exceed threshold, trips circuit breaker and marks worker unhealthy.
+    /// Returns true if the circuit breaker transitioned to tripped on this failure.
+    pub fn record_failure(&mut self) -> bool {
+        self.consecutive_failures += 1;
+        if self.consecutive_failures >= self.circuit_breaker_threshold && self.is_healthy {
+            self.is_healthy = false;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Explicitly restores worker health (e.g. via successful background health check probe).
+    pub fn mark_healthy(&mut self) {
+        self.is_healthy = true;
+        self.consecutive_failures = 0;
     }
 
     /// Current in-flight requests.

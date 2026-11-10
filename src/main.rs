@@ -141,6 +141,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let app_state = Arc::new(AppState::new(radix_tree, worker_pool.clone(), chunker));
 
+            let _prober = radix_gate::proxy::start_health_prober(
+                worker_pool.clone(),
+                reqwest::Client::new(),
+                std::time::Duration::from_secs(5),
+            );
+
             let router = create_router(app_state);
             let addr: SocketAddr = format!("{}:{}", host, port).parse()?;
             info!("[RadixGate] Server listening on http://{}", addr);

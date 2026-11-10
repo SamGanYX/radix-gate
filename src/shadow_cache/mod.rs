@@ -39,6 +39,22 @@ impl WorkerPool {
         self.worker_order.read().clone()
     }
 
+    /// Returns a list of all currently healthy worker IDs.
+    pub fn get_healthy_worker_ids(&self) -> Vec<String> {
+        let order = self.worker_order.read();
+        let workers = self.workers.read();
+        order
+            .iter()
+            .filter(|id| {
+                workers
+                    .get(*id)
+                    .map(|w| w.read().is_healthy)
+                    .unwrap_or(false)
+            })
+            .cloned()
+            .collect()
+    }
+
     /// Number of workers currently registered.
     pub fn len(&self) -> usize {
         self.worker_order.read().len()

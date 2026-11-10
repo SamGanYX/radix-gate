@@ -210,6 +210,20 @@ pub async fn metrics(State(state): State<Arc<AppState>>, headers: HeaderMap) -> 
                 ));
             }
         }
+        prom.push('\n');
+
+        prom.push_str("# HELP radixgate_worker_health Health status of worker (1 = healthy, 0 = circuit-broken)\n");
+        prom.push_str("# TYPE radixgate_worker_health gauge\n");
+        for id in &worker_ids {
+            if let Some(w_lock) = state.worker_pool.get_worker(id) {
+                let w = w_lock.read();
+                let health_val = if w.is_healthy { 1 } else { 0 };
+                prom.push_str(&format!(
+                    "radixgate_worker_health{{worker=\"{}\"}} {}\n",
+                    w.id, health_val
+                ));
+            }
+        }
 
         Response::builder()
             .header("content-type", "text/plain; version=0.0.4; charset=utf-8")
@@ -286,8 +300,9 @@ async fn handle_routing(
         .total_prompt_blocks
         .fetch_add(total_blocks as u64, Ordering::Relaxed);
 
-    // 3. Increment active load on selected worker and acquire optimistic in-flight prefill lease
-    let worker_arc = match state.worker_pool.get_worker(&decision.worker_id) {
+    // 3. Acquire optimistic in-flight prefill lease on selected worker
+    let mut current_worker_id = decision.worker_id.clone();
+    let mut current_worker_arc = match state.worker_pool.get_worker(&current_worker_id) {
         Some(w) => w,
         None => {
             return (
@@ -298,40 +313,27 @@ async fn handle_routing(
         }
     };
 
-    {
-        let worker = worker_arc.read();
-        worker
-            .active_requests
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    }
+    current_worker_arc
+        .read()
+        .active_requests
+        .fetch_add(1, Ordering::SeqCst);
 
     // Optimistically reserve prefix in trie to prevent concurrent thundering-herd cold prefills
     {
         let mut tree = state.radix_tree.write();
-        tree.reserve_in_flight(&block_hashes, &decision.worker_id);
+        tree.reserve_in_flight(&block_hashes, &current_worker_id);
     }
 
-    // 4. Update shadow cache and Radix Tree with newly cached blocks
-    {
-        let mut worker = worker_arc.write();
-        let evicted = worker.record_request(&block_hashes, decision.matched_blocks);
-
-        let mut tree = state.radix_tree.write();
-        tree.insert(&block_hashes, &decision.worker_id);
-
-        if !evicted.is_empty() {
-            tree.prune_empty_nodes();
-        }
-    }
-
-    // 5. Attempt live upstream forwarding if endpoint is a real upstream server
     let endpoint_url = decision.endpoint_url.clone();
     let is_real_upstream =
         endpoint_url.starts_with("http://") || endpoint_url.starts_with("https://");
     let is_mock_port = endpoint_url.contains(":800"); // default mock ports 8001-8004
 
-    let live_response = if is_real_upstream && !is_mock_port {
-        try_forward_upstream(
+    let mut final_response: Option<Response> = None;
+
+    if is_real_upstream && !is_mock_port {
+        // Attempt primary worker
+        match try_forward_upstream(
             &state.client,
             &endpoint_url,
             &headers,
@@ -339,17 +341,122 @@ async fn handle_routing(
             is_anthropic,
         )
         .await
+        {
+            Ok(resp) => {
+                current_worker_arc.write().record_success();
+                final_response = Some(resp);
+            }
+            Err(err) => {
+                warn!(
+                    worker = %current_worker_id,
+                    error = %err,
+                    "Primary upstream worker failed; checking circuit breaker and initiating failover"
+                );
+                let tripped = current_worker_arc.write().record_failure();
+                {
+                    let mut tree = state.radix_tree.write();
+                    tree.release_in_flight(&block_hashes, &current_worker_id, false);
+                    if tripped {
+                        warn!(
+                            worker = %current_worker_id,
+                            "Circuit breaker TRIPPED! Evicting worker from Radix Tree"
+                        );
+                        tree.evict_worker(&current_worker_id);
+                    }
+                }
+                current_worker_arc
+                    .read()
+                    .active_requests
+                    .fetch_sub(1, Ordering::SeqCst);
+
+                // Failover Retry Loop: Attempt other healthy workers in cluster
+                let candidates = state.worker_pool.get_healthy_worker_ids();
+                for candidate_id in candidates {
+                    if candidate_id == current_worker_id {
+                        continue;
+                    }
+                    if let Some(candidate_arc) = state.worker_pool.get_worker(&candidate_id) {
+                        let candidate_url = candidate_arc.read().endpoint_url.clone();
+                        candidate_arc
+                            .read()
+                            .active_requests
+                            .fetch_add(1, Ordering::SeqCst);
+                        state
+                            .radix_tree
+                            .write()
+                            .reserve_in_flight(&block_hashes, &candidate_id);
+
+                        info!(from = %current_worker_id, to = %candidate_id, "Retrying request on failover worker");
+
+                        match try_forward_upstream(
+                            &state.client,
+                            &candidate_url,
+                            &headers,
+                            &payload,
+                            is_anthropic,
+                        )
+                        .await
+                        {
+                            Ok(resp) => {
+                                candidate_arc.write().record_success();
+                                current_worker_id = candidate_id.clone();
+                                current_worker_arc = candidate_arc;
+                                final_response = Some(resp);
+                                break;
+                            }
+                            Err(retry_err) => {
+                                warn!(candidate = %candidate_id, error = %retry_err, "Failover candidate failed");
+                                let tripped = candidate_arc.write().record_failure();
+                                {
+                                    let mut tree = state.radix_tree.write();
+                                    tree.release_in_flight(&block_hashes, &candidate_id, false);
+                                    if tripped {
+                                        tree.evict_worker(&candidate_id);
+                                    }
+                                }
+                                candidate_arc
+                                    .read()
+                                    .active_requests
+                                    .fetch_sub(1, Ordering::SeqCst);
+                            }
+                        }
+                    }
+                }
+            }
+        }
     } else {
-        None
+        // Mock worker mode (for local benchmark verification and unit tests)
+        final_response = Some(build_mock_response(
+            &state,
+            &payload,
+            &decision,
+            is_anthropic,
+        ));
+    }
+
+    // If final_response is still None, all real upstreams failed -> Return HTTP 502 Bad Gateway
+    let mut response = match final_response {
+        Some(resp) => resp,
+        None => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({
+                    "error": {
+                        "message": "Upstream inference cluster unavailable: all candidate replicas failed or timed out",
+                        "type": "bad_gateway",
+                        "code": 502
+                    }
+                })),
+            )
+                .into_response();
+        }
     };
 
     // Decrement worker active requests
-    {
-        let worker = worker_arc.read();
-        worker
-            .active_requests
-            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-    }
+    current_worker_arc
+        .read()
+        .active_requests
+        .fetch_sub(1, Ordering::SeqCst);
 
     let hit_ratio = if total_blocks > 0 {
         decision.matched_blocks as f64 / total_blocks as f64
@@ -357,41 +464,39 @@ async fn handle_routing(
         0.0
     };
 
-    // 6. Return live response if upstream succeeded, else return high-fidelity mock
-    let mut response = match live_response {
-        Some(resp) => {
-            // Check for upstream dynamic eviction header feedback
-            if let Some(evicted_str) = resp
-                .headers()
-                .get("x-evicted-blocks")
-                .and_then(|h| h.to_str().ok())
-            {
-                let blocks: Vec<BlockHash> = evicted_str
-                    .split(',')
-                    .filter_map(|s| s.trim().parse::<u64>().ok())
-                    .collect();
-                if !blocks.is_empty() {
-                    let mut tree = state.radix_tree.write();
-                    tree.evict_blocks(&decision.worker_id, &blocks);
-                }
-            }
-            resp
-        }
-        None => build_mock_response(&state, &payload, &decision, is_anthropic),
-    };
-
-    // Release in-flight reservation lease and transition prefix to confirmed state
+    // 4. Update shadow cache & atomically commit in-flight lease
     {
+        let mut worker = current_worker_arc.write();
+        let evicted = worker.record_request(&block_hashes, decision.matched_blocks);
+
         let mut tree = state.radix_tree.write();
-        tree.release_in_flight(&block_hashes, &decision.worker_id, true);
+        tree.commit_in_flight(&block_hashes, &current_worker_id);
+
+        if !evicted.is_empty() {
+            tree.prune_empty_nodes();
+        }
+
+        // Check for upstream dynamic eviction header feedback
+        if let Some(evicted_str) = response
+            .headers()
+            .get("x-evicted-blocks")
+            .and_then(|h| h.to_str().ok())
+        {
+            let blocks: Vec<BlockHash> = evicted_str
+                .split(',')
+                .filter_map(|s| s.trim().parse::<u64>().ok())
+                .collect();
+            if !blocks.is_empty() {
+                tree.evict_blocks(&current_worker_id, &blocks);
+            }
+        }
     }
 
     // Inject Radix Gateway telemetry headers
     let headers_mut = response.headers_mut();
     headers_mut.insert(
         "X-Radix-Worker",
-        decision
-            .worker_id
+        current_worker_id
             .parse()
             .unwrap_or_else(|_| "unknown".parse().unwrap()),
     );
@@ -418,7 +523,7 @@ async fn try_forward_upstream(
     client_headers: &HeaderMap,
     payload: &ChatRequest,
     is_anthropic: bool,
-) -> Option<Response> {
+) -> Result<Response, String> {
     let path = if is_anthropic {
         "/v1/messages"
     } else {
@@ -442,6 +547,11 @@ async fn try_forward_upstream(
         Ok(upstream_resp) => {
             let status =
                 StatusCode::from_u16(upstream_resp.status().as_u16()).unwrap_or(StatusCode::OK);
+
+            if status.is_server_error() {
+                return Err(format!("Upstream returned HTTP server error {}", status));
+            }
+
             let content_type = upstream_resp
                 .headers()
                 .get("content-type")
@@ -449,21 +559,20 @@ async fn try_forward_upstream(
                 .unwrap_or("application/json")
                 .to_string();
 
-            let body = Body::from_stream(upstream_resp.bytes_stream());
-            let response = Response::builder()
+            let mut response_builder = Response::builder()
                 .status(status)
-                .header("content-type", content_type)
-                .body(body)
-                .unwrap_or_else(|_| {
-                    (StatusCode::INTERNAL_SERVER_ERROR, "Stream building error").into_response()
-                });
+                .header("content-type", content_type);
 
-            Some(response)
+            if let Some(evicted) = upstream_resp.headers().get("x-evicted-blocks") {
+                response_builder = response_builder.header("x-evicted-blocks", evicted);
+            }
+
+            let body = Body::from_stream(upstream_resp.bytes_stream());
+            response_builder
+                .body(body)
+                .map_err(|e| format!("Stream building error: {}", e))
         }
-        Err(err) => {
-            warn!(url = %target_url, error = %err, "Upstream connection failed; falling back to simulated response");
-            None
-        }
+        Err(err) => Err(format!("Upstream connection failed: {}", err)),
     }
 }
 
@@ -523,4 +632,125 @@ fn build_mock_response(
 
 fn uuid_simple() -> String {
     format!("{:08x}{:08x}", rand::random::<u32>(), rand::random::<u32>())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::proxy::create_router;
+    use crate::shadow_cache::{WorkerPool, WorkerReplica};
+    use crate::tokenizer::BlockChunker;
+    use crate::trie::RadixTree;
+    use parking_lot::RwLock;
+
+    #[tokio::test]
+    async fn test_upstream_failover_and_502_bad_gateway() {
+        // Setup healthy secondary worker server returning 200 OK
+        let healthy_app = axum::Router::new().route(
+            "/v1/messages",
+            axum::routing::post(|| async {
+                Json(json!({
+                    "id": "msg_healthy",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "healthy response"}],
+                    "model": "claude-3-5-sonnet",
+                    "usage": {"input_tokens": 10, "output_tokens": 5}
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let healthy_port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener, healthy_app).await.unwrap();
+        });
+
+        // Worker 1: dead port (19999)
+        // Worker 2: healthy port
+        let radix_tree = Arc::new(RwLock::new(RadixTree::new(64)));
+        let worker_pool = Arc::new(WorkerPool::new());
+        worker_pool.add_worker(WorkerReplica::new(
+            "worker-dead".into(),
+            "http://127.0.0.1:19999".into(),
+            1000,
+            16,
+        ));
+        worker_pool.add_worker(WorkerReplica::new(
+            "worker-healthy".into(),
+            format!("http://127.0.0.1:{}", healthy_port),
+            1000,
+            16,
+        ));
+
+        // Warm worker-dead with the prefix so it is initially selected by the radix router
+        let chunker = BlockChunker::new(64);
+        let prompt = "Initial shared prompt for testing failover.";
+        let blocks = chunker.chunk_text(prompt);
+        radix_tree.write().insert(&blocks, "worker-dead");
+
+        let state = Arc::new(AppState::new(
+            radix_tree.clone(),
+            worker_pool.clone(),
+            chunker,
+        ));
+        let router = create_router(state);
+
+        let test_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let test_port = test_listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(test_listener, router).await.unwrap();
+        });
+
+        let client = reqwest::Client::new();
+        let req_body = json!({
+            "model": "claude-3-5-sonnet-20241022",
+            "messages": [{"role": "user", "content": prompt}]
+        });
+
+        // 1. Send request: worker-dead fails, router automatically fails over to worker-healthy!
+        let resp = client
+            .post(format!("http://127.0.0.1:{}/v1/messages", test_port))
+            .json(&req_body)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let routed_worker = resp
+            .headers()
+            .get("x-radix-worker")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(routed_worker, "worker-healthy");
+
+        // 2. Test 502 Bad Gateway when all upstreams are dead
+        let dead_pool = Arc::new(WorkerPool::new());
+        dead_pool.add_worker(WorkerReplica::new(
+            "dead-only".into(),
+            "http://127.0.0.1:19998".into(),
+            1000,
+            16,
+        ));
+        let dead_state = Arc::new(AppState::new(
+            Arc::new(RwLock::new(RadixTree::new(64))),
+            dead_pool,
+            BlockChunker::new(64),
+        ));
+        let dead_router = create_router(dead_state);
+        let dead_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead_port = dead_listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(dead_listener, dead_router).await.unwrap();
+        });
+
+        let dead_resp = client
+            .post(format!("http://127.0.0.1:{}/v1/messages", dead_port))
+            .json(&req_body)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(dead_resp.status(), StatusCode::BAD_GATEWAY);
+    }
 }
