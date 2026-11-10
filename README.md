@@ -75,9 +75,12 @@ Observed performance characteristics:
 - **Compressed Radix Tree**: Token block sequences are indexed using an adaptive radix trie with $\mathcal{O}(L)$ prefix lookup complexity, where $L$ is the prompt block depth.
 - **Zero-Allocation Token Chunking**: Fast rolling XXH3 64-bit hashing across configurable block windows (default: 64 tokens, configurable for Anthropic 1,024-token breakpoints).
 - **Shadow LRU Cache Tracking**: Tracks GPU memory capacity limits per worker and simulates LRU eviction to prevent routing against stale prefixes.
+- **Power-of-Two-Choices with Prefix Bias (P2C-Prefix)**: Mitigates stampedes and herd-flapping by sampling two candidate replicas and picking the best joint score under bounded loads.
 - **Dual API Compatibility**: Native endpoint support for both Anthropic (`/v1/messages`) and OpenAI (`/v1/chat/completions`) schemas.
 - **Zero-Copy Streaming**: Pass-through Server-Sent Events (`text/event-stream`) streaming with injected telemetry headers (`X-Radix-Worker`, `X-Radix-Matched-Blocks`, `X-Radix-Hit-Ratio`).
-- **Telemetry & Metrics**: Built-in Prometheus-compatible runtime metrics (`/metrics`) and health checks (`/health`).
+- **Telemetry & OpenMetrics Exporter**: Native Prometheus OpenMetrics text format exporter (`/metrics` with auto-negotiation for `text/plain` vs `application/json`) and health checks (`/health`).
+- **Live Topology Visualizer**: Real-time ASCII prefix tree rendering via HTTP (`/api/v1/tree`) or CLI (`radix-gate tree`).
+- **High-Concurrency Socket Load Generator**: Built-in async benchmark engine (`radix-gate load-test`) testing real socket connection pools, P50-P99 latencies, and cache hit ratios.
 
 ---
 
@@ -153,27 +156,85 @@ curl -X POST http://localhost:8080/v1/chat/completions \
   }'
 ```
 
-#### Telemetry
+#### Telemetry & Metrics (Prometheus / OpenMetrics)
+
+Prometheus scrape target (default `text/plain`):
 ```bash
 curl http://localhost:8080/metrics
 ```
 
-Response includes trie node count, cache hit ratio, active worker distribution, and per-worker utilization:
-```json
-{
-  "performance": {
-    "cluster_cache_hit_ratio": "86.60%",
-    "total_matched_blocks": 15420,
-    "total_prompt_blocks": 17800,
-    "total_requests": 1000
-  },
-  "radix_tree": {
-    "total_nodes": 42,
-    "unique_workers": 4
-  },
-  "status": "healthy"
-}
+Output:
+```text
+# HELP radixgate_requests_total Total number of routed inference requests
+# TYPE radixgate_requests_total counter
+radixgate_requests_total 1000
+
+# HELP radixgate_cache_hit_ratio Global cluster KV-cache prefix hit ratio
+# TYPE radixgate_cache_hit_ratio gauge
+radixgate_cache_hit_ratio 0.8660
+
+# HELP radixgate_matched_blocks_total Total token blocks matched across cache
+# TYPE radixgate_matched_blocks_total counter
+radixgate_matched_blocks_total 15420
+
+# HELP radixgate_prompt_blocks_total Total token blocks received in prompts
+# TYPE radixgate_prompt_blocks_total counter
+radixgate_prompt_blocks_total 17800
+
+# HELP radixgate_worker_load Active requests in-flight per inference worker
+# TYPE radixgate_worker_load gauge
+radixgate_worker_load{worker="worker-01"} 2
+radixgate_worker_load{worker="worker-02"} 1
 ```
+
+JSON telemetry format is available via `Accept: application/json`:
+```bash
+curl -H "Accept: application/json" http://localhost:8080/metrics
+```
+
+### 4. Live Prefix Tree Inspection
+
+Display the active compressed Radix Tree topology, showing cached workers per branch, prefix block ranges, in-flight leases, and hit counts:
+
+```bash
+cargo run --release -- tree --url http://localhost:8080
+```
+
+Or query the HTTP endpoint directly:
+```bash
+curl http://localhost:8080/api/v1/tree
+```
+
+Sample output:
+```text
+ROOT [block_size: 64 tokens]
+├── [0x8f2a1b9c..0x3e110a72] (4 blk) [Cached: worker-01, worker-03] (Hits: 284)
+│   ├── [0x09a4128f] [Cached: worker-01] [InFlight: 1] (Hits: 92)
+│   └── [0x7b5e4120..0x91d302a4] (2 blk) [Cached: worker-03] (Hits: 14)
+└── [0x41f8021c] [Cached: worker-02] (Hits: 110)
+```
+
+### 5. High-Concurrency Async Socket Load Generator
+
+Benchmark real socket throughput, TCP connection reuse, P50–P99 latencies, and cache efficiency under multi-turn agent workloads:
+
+```bash
+cargo run --release -- load-test \
+  --url http://127.0.0.1:8080 \
+  --concurrency 50 \
+  --requests 1000 \
+  --endpoint messages \
+  --shared-prefixes 4 \
+  --turns 3
+```
+
+Available flags:
+- `--url <URL>`: Gateway base URL (default: `http://127.0.0.1:8080`).
+- `--concurrency <N>`: Concurrent async Tokio worker tasks (default: `20`).
+- `--requests <N>`: Total requests to execute (default: `200`).
+- `--endpoint <ENDPOINT>`: `messages` (`/v1/messages`) or `chat` (`/v1/chat/completions`).
+- `--shared-prefixes <N>`: Number of distinct shared system prompt archetypes (default: `4`).
+- `--turns <N>`: Sequential conversation turns per session before rotating prefix (default: `3`).
 
 ---
 
@@ -203,15 +264,24 @@ RadixGate integrates `tiktoken-rs` (`cl100k_base`), chunking directly over canon
 ### 4. Partitioned Concurrency (Sharded Radix Trie)
 Under high concurrency, acquiring a global write lock on a central trie for every request completion creates severe CPU contention. RadixGate provides `ShardedRadixTree`, which partitions the trie into $N$ independent shards indexed by a 64-bit mixer hash of the prompt's root token block. Requests with distinct prefixes operate in parallel across independent `RwLock` shards without lock contention.
 
+### 5. Stampede & Herd-Flapping Prevention via P2C-Prefix
+Greedy prefix matching (always picking the replica with the highest $\text{LCP}$) causes pathological stampedes when thousands of concurrent clients query the same popular prefix. The single replica holding that prefix becomes saturated, causing queued request latencies to far exceed the time required to simply re-prefill the prompt on an idle replica.
+
+RadixGate implements **Power-of-Two-Choices with Prefix Bias (P2C-Prefix)** (`PowerOfTwoChoicesPolicy`):
+- Randomly samples two candidate replicas $W_a$ and $W_b$ from the cluster.
+- Evaluates composite scores balancing normalized prefix length against queued in-flight requests.
+- Applies a hard load ceiling ($c \cdot \bar{L}$, where $\bar{L}$ is average cluster load). If a candidate exceeds the bounded load ceiling, the router spills traffic to an underloaded alternative, bounding maximum queue delay to $\mathcal{O}(\log \log N)$ while maintaining high prefix hit rates.
+
 ---
 
 ## Architecture Details
 
-- `src/trie/`: Radix tree implementation with branch splitting, in-flight leases, and sharded partitioning (`ShardedRadixTree`).
+- `src/trie/`: Radix tree implementation with branch splitting, in-flight leases, ASCII visualization, and sharded partitioning (`ShardedRadixTree`).
 - `src/tokenizer.rs`: Exact BPE token chunker (`tiktoken-rs`) and zero-allocation streaming fallback.
-- `src/balancer/`: Multi-objective routing policies (`PrefixAware`, `RoundRobin`, `LeastLoaded`).
+- `src/balancer/`: Multi-objective routing policies (`PrefixAware`, `PowerOfTwoChoices`, `RoundRobin`, `LeastLoaded`).
 - `src/shadow_cache/`: Worker capacity tracker and O(1) doubly-linked list LRU state mirror.
-- `src/proxy/`: Axum-based HTTP proxy, request parser, cache sync handler, and telemetry decorator.
+- `src/proxy/`: Axum-based HTTP proxy, Prometheus OpenMetrics exporter, cache sync ingress, and telemetry decorator.
+- `src/load_test.rs`: High-concurrency async socket load generator and percentile latency analyzer.
 - `src/simulator/`: Discrete event benchmark harness with prefill/decode latency model.
 
 ---
