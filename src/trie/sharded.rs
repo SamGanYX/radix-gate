@@ -112,4 +112,22 @@ impl ShardedRadixTree {
     pub fn block_size_tokens(&self) -> usize {
         self.block_size_tokens
     }
+
+    /// Renders an ASCII visual tree representation across all non-empty shards.
+    pub fn render_ascii(&self) -> String {
+        let mut out = String::new();
+        for (i, shard_lock) in self.shards.iter().enumerate() {
+            let shard = shard_lock.read();
+            let (nodes, _) = shard.stats();
+            if nodes > 1 || (self.num_shards == 1 && nodes > 0) {
+                out.push_str(&format!("--- SHARD {} ---\n", i));
+                out.push_str(&shard.render_ascii());
+                out.push('\n');
+            }
+        }
+        if out.is_empty() {
+            out.push_str("EMPTY SHARDED RADIX TREE\n");
+        }
+        out
+    }
 }

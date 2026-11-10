@@ -14,6 +14,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/health", get(handler::health))
         .route("/metrics", get(handler::metrics))
+        .route("/api/v1/tree", get(handler::handle_tree))
         .route("/v1/cache/sync", post(handler::handle_cache_sync))
         .route(
             "/v1/chat/completions",

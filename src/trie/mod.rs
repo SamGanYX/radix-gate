@@ -312,11 +312,78 @@ impl RadixTree {
             Self::collect_stats(child, count, workers);
         }
     }
+
+    /// Renders an ASCII visual tree representation of active prefix branches, cached workers, and depths.
+    pub fn render_ascii(&self) -> String {
+        let mut out = format!("ROOT [block_size: {} tokens]\n", self.block_size_tokens);
+        Self::render_node_ascii(&self.root, "", &mut out);
+        out
+    }
+
+    fn render_node_ascii(node: &RadixNode, prefix: &str, out: &mut String) {
+        let mut children: Vec<(&BlockHash, &RadixNode)> = node.children.iter().collect();
+        children.sort_by_key(|(k, _)| **k);
+        let child_count = children.len();
+
+        for (idx, (_key, child)) in children.iter().enumerate() {
+            let is_last = idx + 1 == child_count;
+            let branch = if is_last { "└── " } else { "├── " };
+            let next_prefix = if is_last { "    " } else { "│   " };
+
+            let block_range = if child.prefix.len() == 1 {
+                format!("[0x{:08x}]", child.prefix[0])
+            } else if child.prefix.len() > 1 {
+                format!(
+                    "[0x{:08x}..0x{:08x}] ({} blk)",
+                    child.prefix[0],
+                    child.prefix.last().copied().unwrap_or(0),
+                    child.prefix.len()
+                )
+            } else {
+                "[]".to_string()
+            };
+
+            let mut cached: Vec<&str> = child.cached_workers.iter().map(|w| &**w).collect();
+            cached.sort();
+            let cached_str = if cached.is_empty() {
+                "none".to_string()
+            } else {
+                cached.join(", ")
+            };
+
+            let in_flight_total: usize = child.in_flight_workers.values().sum();
+            let in_flight_str = if in_flight_total > 0 {
+                format!(" [InFlight: {}]", in_flight_total)
+            } else {
+                String::new()
+            };
+
+            out.push_str(&format!(
+                "{}{}{} [Cached: {}]{} (Hits: {})\n",
+                prefix, branch, block_range, cached_str, in_flight_str, child.hit_count
+            ));
+
+            let combined_prefix = format!("{}{}", prefix, next_prefix);
+            Self::render_node_ascii(child, &combined_prefix, out);
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_radix_tree_render_ascii() {
+        let mut trie = RadixTree::new(64);
+        trie.insert(&[0x1000, 0x2000], "worker-01");
+        trie.insert(&[0x1000, 0x3000], "worker-02");
+
+        let ascii = trie.render_ascii();
+        assert!(ascii.contains("ROOT"));
+        assert!(ascii.contains("[Cached: worker-01]"));
+        assert!(ascii.contains("[Cached: worker-02]"));
+    }
 
     #[test]
     fn test_radix_tree_in_flight_coalescing() {

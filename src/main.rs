@@ -48,6 +48,11 @@ enum Commands {
         #[arg(long, default_value_t = 64)]
         block_size: usize,
     },
+    /// Inspect the active prefix tree topology via ASCII visualizer from a running instance
+    Tree {
+        #[arg(long, default_value = "http://127.0.0.1:8080")]
+        url: String,
+    },
 }
 
 #[tokio::main]
@@ -134,6 +139,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let listener = tokio::net::TcpListener::bind(addr).await?;
             axum::serve(listener, router).await?;
+        }
+        Commands::Tree { url } => {
+            let target_url = format!("{}/api/v1/tree", url.trim_end_matches('/'));
+            println!(
+                "[RadixGate] Querying Radix Tree visualizer from {}...",
+                target_url
+            );
+            let client = reqwest::Client::new();
+            match client.get(&target_url).send().await {
+                Ok(resp) => {
+                    if resp.status().is_success() {
+                        let text = resp.text().await?;
+                        println!("\n=== LIVE RADIX TREE TOPOLOGY ===");
+                        print!("{}", text);
+                        println!("================================\n");
+                    } else {
+                        eprintln!(
+                            "[Error] Server returned HTTP {}: {}",
+                            resp.status(),
+                            resp.text().await.unwrap_or_default()
+                        );
+                    }
+                }
+                Err(err) => {
+                    eprintln!(
+                        "[Error] Failed to connect to radix-gate instance at {}: {}",
+                        target_url, err
+                    );
+                }
+            }
         }
     }
 

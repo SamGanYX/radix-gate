@@ -343,8 +343,18 @@ mod tests {
     #[test]
     fn test_p2c_prefix_load_balancing() {
         let pool = WorkerPool::new();
-        pool.add_worker(WorkerReplica::new("w-01".into(), "http://w1".into(), 1000, 10));
-        pool.add_worker(WorkerReplica::new("w-02".into(), "http://w2".into(), 1000, 10));
+        pool.add_worker(WorkerReplica::new(
+            "w-01".into(),
+            "http://w1".into(),
+            1000,
+            10,
+        ));
+        pool.add_worker(WorkerReplica::new(
+            "w-02".into(),
+            "http://w2".into(),
+            1000,
+            10,
+        ));
 
         let mut tree = RadixTree::new(64);
         let prefix = vec![1, 2, 3];

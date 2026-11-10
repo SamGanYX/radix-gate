@@ -59,6 +59,18 @@ pub async fn health() -> impl IntoResponse {
     Json(json!({ "status": "ok", "service": "radix-gate" }))
 }
 
+/// Renders the active Radix Tree branches as plain text ASCII.
+pub async fn handle_tree(State(state): State<Arc<AppState>>) -> Response {
+    let tree = state.radix_tree.read();
+    let ascii = tree.render_ascii();
+    Response::builder()
+        .header("content-type", "text/plain; charset=utf-8")
+        .body(Body::from(ascii))
+        .unwrap_or_else(|_| {
+            (StatusCode::INTERNAL_SERVER_ERROR, "Tree render error").into_response()
+        })
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 pub struct CacheSyncPayload {
     pub worker_id: String,
@@ -89,10 +101,7 @@ pub async fn handle_cache_sync(
 
 /// Global cluster and Radix Tree metrics endpoint.
 /// Returns standard Prometheus text format by default (or JSON if Accept: application/json).
-pub async fn metrics(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> Response {
+pub async fn metrics(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     let (nodes, active_workers) = {
         let tree = state.radix_tree.read();
         tree.stats()
@@ -149,15 +158,21 @@ pub async fn metrics(
     } else {
         // Prometheus / OpenMetrics text format
         let mut prom = String::new();
-        prom.push_str("# HELP radixgate_requests_total Total number of routed inference requests\n");
+        prom.push_str(
+            "# HELP radixgate_requests_total Total number of routed inference requests\n",
+        );
         prom.push_str("# TYPE radixgate_requests_total counter\n");
         prom.push_str(&format!("radixgate_requests_total {}\n\n", total_reqs));
 
-        prom.push_str("# HELP radixgate_cache_hit_ratio Global cluster KV-cache prefix hit ratio\n");
+        prom.push_str(
+            "# HELP radixgate_cache_hit_ratio Global cluster KV-cache prefix hit ratio\n",
+        );
         prom.push_str("# TYPE radixgate_cache_hit_ratio gauge\n");
         prom.push_str(&format!("radixgate_cache_hit_ratio {:.4}\n\n", hit_ratio));
 
-        prom.push_str("# HELP radixgate_matched_blocks_total Total token blocks matched across cache\n");
+        prom.push_str(
+            "# HELP radixgate_matched_blocks_total Total token blocks matched across cache\n",
+        );
         prom.push_str("# TYPE radixgate_matched_blocks_total counter\n");
         prom.push_str(&format!("radixgate_matched_blocks_total {}\n\n", matched_b));
 
@@ -174,7 +189,11 @@ pub async fn metrics(
         for id in &worker_ids {
             if let Some(w_lock) = state.worker_pool.get_worker(id) {
                 let w = w_lock.read();
-                prom.push_str(&format!("radixgate_worker_load{{worker=\"{}\"}} {}\n", w.id, w.load()));
+                prom.push_str(&format!(
+                    "radixgate_worker_load{{worker=\"{}\"}} {}\n",
+                    w.id,
+                    w.load()
+                ));
             }
         }
         prom.push('\n');
@@ -195,7 +214,9 @@ pub async fn metrics(
         Response::builder()
             .header("content-type", "text/plain; version=0.0.4; charset=utf-8")
             .body(Body::from(prom))
-            .unwrap_or_else(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Prometheus format error").into_response())
+            .unwrap_or_else(|_| {
+                (StatusCode::INTERNAL_SERVER_ERROR, "Prometheus format error").into_response()
+            })
     }
 }
 
