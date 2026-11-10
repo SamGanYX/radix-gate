@@ -53,6 +53,21 @@ enum Commands {
         #[arg(long, default_value = "http://127.0.0.1:8080")]
         url: String,
     },
+    /// High-concurrency async socket load generator against /v1/messages or /v1/chat/completions
+    LoadTest {
+        #[arg(long, default_value = "http://127.0.0.1:8080")]
+        url: String,
+        #[arg(long, default_value_t = 20)]
+        concurrency: usize,
+        #[arg(long, default_value_t = 200)]
+        requests: usize,
+        #[arg(long, default_value = "messages")]
+        endpoint: String,
+        #[arg(long, default_value_t = 4)]
+        shared_prefixes: usize,
+        #[arg(long, default_value_t = 3)]
+        turns: usize,
+    },
 }
 
 #[tokio::main]
@@ -167,6 +182,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         "[Error] Failed to connect to radix-gate instance at {}: {}",
                         target_url, err
                     );
+                }
+            }
+        }
+        Commands::LoadTest {
+            url,
+            concurrency,
+            requests,
+            endpoint,
+            shared_prefixes,
+            turns,
+        } => {
+            let ep = endpoint
+                .parse::<radix_gate::LoadTestEndpoint>()
+                .unwrap_or(radix_gate::LoadTestEndpoint::Messages);
+            println!("\n[RadixGate] Launching async socket load generator...");
+            println!("  Target URL:        {url}");
+            println!("  Concurrency:       {concurrency} async workers");
+            println!("  Total Requests:    {requests}");
+            println!("  Endpoint:          {ep:?}");
+            println!("  Shared Prefixes:   {shared_prefixes}");
+            println!("  Turns Per Session: {turns}");
+
+            let config = radix_gate::LoadTestConfig {
+                target_url: url,
+                concurrency,
+                total_requests: requests,
+                endpoint: ep,
+                num_shared_prefixes: shared_prefixes,
+                turns_per_session: turns,
+                request_timeout: std::time::Duration::from_secs(15),
+            };
+
+            let runner = radix_gate::LoadTestRunner::new(config);
+            match runner.run().await {
+                Ok(summary) => {
+                    radix_gate::LoadTestRunner::render_summary_table(&summary);
+                }
+                Err(e) => {
+                    eprintln!("[Error] Load generator failed: {e}");
                 }
             }
         }

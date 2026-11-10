@@ -1,4 +1,5 @@
 pub mod balancer;
+pub mod load_test;
 pub mod proxy;
 pub mod shadow_cache;
 pub mod simulator;
@@ -9,6 +10,7 @@ pub use balancer::policies::{
     LeastLoadedPolicy, PowerOfTwoChoicesPolicy, PrefixAwarePolicy, RoundRobinPolicy,
 };
 pub use balancer::{RoutingDecision, RoutingPolicy};
+pub use load_test::{LoadTestConfig, LoadTestEndpoint, LoadTestRunner, LoadTestSummary};
 pub use proxy::{AppState, create_router};
 pub use shadow_cache::{WorkerPool, WorkerReplica};
 pub use simulator::{BenchmarkConfig, ClusterSimulator, PolicyBenchmarkResult};
