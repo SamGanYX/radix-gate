@@ -8,11 +8,16 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
 
 jobs:
   test:
-    name: Test & Lint
-    runs-on: ubuntu-latest
+    name: Test & Lint (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
 
@@ -21,7 +26,7 @@ jobs:
         with:
           components: clippy, rustfmt
 
-      - name: Cache Cargo dependencies
+      - name: Cargo Cache
         uses: actions/cache@v4
         with:
           path: |
@@ -38,10 +43,33 @@ jobs:
         run: cargo fmt --check
 
       - name: Clippy Linter
-        run: cargo clippy -- -D warnings
+        run: cargo clippy --all-targets -- -D warnings
 
-      - name: Run Unit Tests
-        run: cargo test --verbose
+      - name: Run Test Suite
+        run: cargo test --all-targets --verbose
 
-      - name: Run Headless Benchmark Verification
-        run: cargo run --release -- bench --workers 4 --requests 200 --kv-blocks 150 --agents 10
+      - name: Run E2E Integration Suite
+        run: cargo test --test e2e_showcase --verbose
+
+      - name: Run Comparative Benchmark Smoke Test
+        run: cargo run --release -- bench --workers 4 --requests 200 --kv-blocks 150 --agents 6
+
+  docker-build:
+    name: Multi-Arch Container Build Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Multi-Arch Docker Image (linux/amd64, linux/arm64)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: false
+          tags: radix-gate:test

@@ -296,6 +296,43 @@ app.add_middleware(
 )
 ```
 
+### 9. True Bidirectional Server-Sent Events (SSE) Streaming
+
+RadixGate features native zero-copy Server-Sent Events passthrough (`text/event-stream; charset=utf-8`) with active concurrency tracking:
+
+```bash
+# OpenAI SSE streaming
+curl -N http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gpt-4o",
+    "messages": [{"role": "user", "content": "Explain KV-cache streaming."}],
+    "stream": true
+  }'
+
+# Anthropic SSE streaming
+curl -N http://localhost:8080/v1/messages \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "claude-3-5-sonnet-20241022",
+    "messages": [{"role": "user", "content": "Explain KV-cache streaming."}],
+    "stream": true
+  }'
+```
+
+- **Zero-Buffering**: Chunks are forwarded immediately with `Cache-Control: no-cache, no-transform` and `X-Accel-Buffering: no` for minimal TTFT.
+- **RAII `InFlightGuard`**: Concurrency counters on worker replicas stay accurately tracked until the final stream token is emitted or client disconnect occurs, preventing load balancer estimation drift.
+
+### 10. Multi-Arch Container Images & GitHub Actions CI/CD
+
+Pre-built multi-platform container images are automatically published via GitHub Actions to the GitHub Container Registry (GHCR):
+
+```bash
+# Pull and run multi-arch image (linux/amd64, linux/arm64)
+docker pull ghcr.io/samganyx/radix-gate:latest
+docker run -p 8080:8080 ghcr.io/samganyx/radix-gate:latest serve --mock-workers 4
+```
+
 ---
 
 ## Distributed Systems Design & Edge-Case Handling

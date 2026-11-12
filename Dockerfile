@@ -1,14 +1,19 @@
-FROM rust:1.80-slim as builder
+# Multi-stage production build for RadixGate
+FROM rust:slim AS builder
 WORKDIR /app
 
-# Cache dependencies
-COPY Cargo.toml ./
-RUN mkdir -p src && echo "fn main() {}" > src/main.rs && echo "pub fn dummy() {}" > src/lib.rs && cargo build --release || true
+RUN apt-get update && apt-get install -y --no-install-recommends pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
 
-# Copy source tree and compile release binary
+COPY Cargo.toml Cargo.lock* ./
+RUN mkdir -p src && echo "pub fn dummy() {}" > src/lib.rs && echo "fn main() {}" > src/main.rs
+RUN cargo build --release || true
+
+# Copy source tree and compile optimized release binary
 COPY src ./src
-RUN cargo build --release
+COPY tests ./tests
+RUN touch src/lib.rs src/main.rs && cargo build --release
 
+# Minimal runtime image
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl && rm -rf /var/lib/apt/lists/*
 WORKDIR /app

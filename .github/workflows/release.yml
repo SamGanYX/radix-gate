@@ -1,0 +1,113 @@
+name: Release & Container Publishing
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  publish-container:
+    name: Build & Push Multi-Arch Container (GHCR)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push multi-arch image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  publish-binaries:
+    name: Build Native Release Binaries
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            artifact_name: radix-gate
+            asset_name: radix-gate-x86_64-unknown-linux-gnu
+          - target: x86_64-apple-darwin
+            os: macos-13
+            artifact_name: radix-gate
+            asset_name: radix-gate-x86_64-apple-darwin
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            artifact_name: radix-gate
+            asset_name: radix-gate-aarch64-apple-darwin
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            artifact_name: radix-gate.exe
+            asset_name: radix-gate-x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build Release Binary
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package Binary (Unix)
+        if: matrix.os != 'windows-latest'
+        run: |
+          mkdir -p staging
+          cp target/${{ matrix.target }}/release/${{ matrix.artifact_name }} staging/
+          cd staging
+          tar -czf ../${{ matrix.asset_name }}.tar.gz ${{ matrix.artifact_name }}
+          shasum -a 256 ../${{ matrix.asset_name }}.tar.gz > ../${{ matrix.asset_name }}.tar.gz.sha256
+
+      - name: Package Binary (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path staging
+          Copy-Item "target/${{ matrix.target }}/release/${{ matrix.artifact_name }}" -Destination staging/
+          Compress-Archive -Path "staging/${{ matrix.artifact_name }}" -DestinationPath "${{ matrix.asset_name }}.zip"
+          (Get-FileHash -Algorithm SHA256 "${{ matrix.asset_name }}.zip").Hash | Out-File -Encoding ASCII "${{ matrix.asset_name }}.zip.sha256"
+
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: |
+            radix-gate-*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
