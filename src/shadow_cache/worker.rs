@@ -1,6 +1,29 @@
 use crate::trie::BlockHash;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
+
+/// Specialized role for disaggregated prefill/decode cluster architectures (e.g. Mooncake / Splitwise).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum WorkerRole {
+    /// Compute-dense node optimized for high-FLOP prompt prefill matrix multiplication.
+    Prefill,
+    /// Memory-bandwidth-dense node with massive KV-cache capacity optimized for low-latency autoregressive token generation.
+    Decode,
+    /// Standard monolithic replica executing both prefill and decode phases.
+    #[default]
+    Unified,
+}
+
+impl WorkerRole {
+    pub fn badge(&self) -> &'static str {
+        match self {
+            Self::Prefill => "[P]",
+            Self::Decode => "[D]",
+            Self::Unified => "[U]",
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 struct LruNode {
@@ -145,6 +168,7 @@ pub struct WorkerReplica {
     pub is_healthy: bool,
     pub consecutive_failures: usize,
     pub circuit_breaker_threshold: usize,
+    pub role: WorkerRole,
 
     // High-performance O(1) shadow LRU cache state
     lru: FastLru,
@@ -162,6 +186,22 @@ impl WorkerReplica {
         max_kv_blocks: usize,
         max_concurrency: usize,
     ) -> Self {
+        Self::new_with_role(
+            id,
+            endpoint_url,
+            max_kv_blocks,
+            max_concurrency,
+            WorkerRole::Unified,
+        )
+    }
+
+    pub fn new_with_role(
+        id: String,
+        endpoint_url: String,
+        max_kv_blocks: usize,
+        max_concurrency: usize,
+        role: WorkerRole,
+    ) -> Self {
         Self {
             id,
             endpoint_url,
@@ -171,6 +211,7 @@ impl WorkerReplica {
             is_healthy: true,
             consecutive_failures: 0,
             circuit_breaker_threshold: 3,
+            role,
             lru: FastLru::new(),
             total_requests_routed: 0,
             total_matched_blocks: 0,

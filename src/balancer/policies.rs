@@ -75,7 +75,28 @@ impl RoutingPolicy for PrefixAwarePolicy {
             let load_factor = worker.load_factor();
 
             // Multi-objective score: reward warm KV cache, penalize overloaded workers
-            let score = (self.alpha * cache_affinity) - (self.beta * load_factor);
+            // Integrate Prefill-Decode disaggregation bias
+            let role_bias = match worker.role {
+                crate::shadow_cache::WorkerRole::Prefill => {
+                    if cache_affinity < 0.40 && total_blocks > 2 {
+                        0.25 // Route heavy cold prefill to specialized compute-dense node
+                    } else {
+                        -0.10
+                    }
+                }
+                crate::shadow_cache::WorkerRole::Decode => {
+                    if cache_affinity >= 0.70 {
+                        0.20 // Route warm KV lookups directly to decode node
+                    } else if cache_affinity < 0.30 {
+                        -0.40 // Protect decode node memory bandwidth from long cold prefills
+                    } else {
+                        0.0
+                    }
+                }
+                crate::shadow_cache::WorkerRole::Unified => 0.0,
+            };
+
+            let score = (self.alpha * cache_affinity) - (self.beta * load_factor) + role_bias;
 
             if score > best_score {
                 best_score = score;
@@ -242,10 +263,44 @@ impl RoutingPolicy for PowerOfTwoChoicesPolicy {
         let worker_a = pool.get_worker(choice_a)?;
         let worker_b = pool.get_worker(choice_b)?;
 
-        let load_a = worker_a.read().load();
-        let load_b = worker_b.read().load();
+        let score_a = {
+            let w = worker_a.read();
+            let matched = match_result
+                .worker_matches
+                .get(choice_a.as_str())
+                .copied()
+                .unwrap_or(0);
+            let affinity = matched as f64 / prompt_blocks.len().max(1) as f64;
+            let role_bonus = match w.role {
+                crate::shadow_cache::WorkerRole::Prefill if affinity < 0.35 => 0.25,
+                crate::shadow_cache::WorkerRole::Decode if affinity >= 0.70 => 0.20,
+                crate::shadow_cache::WorkerRole::Decode if affinity < 0.35 => -0.35,
+                _ => 0.0,
+            };
+            affinity - (0.50 * w.load_factor()) + role_bonus
+        };
+        let score_b = {
+            let w = worker_b.read();
+            let matched = match_result
+                .worker_matches
+                .get(choice_b.as_str())
+                .copied()
+                .unwrap_or(0);
+            let affinity = matched as f64 / prompt_blocks.len().max(1) as f64;
+            let role_bonus = match w.role {
+                crate::shadow_cache::WorkerRole::Prefill if affinity < 0.35 => 0.25,
+                crate::shadow_cache::WorkerRole::Decode if affinity >= 0.70 => 0.20,
+                crate::shadow_cache::WorkerRole::Decode if affinity < 0.35 => -0.35,
+                _ => 0.0,
+            };
+            affinity - (0.50 * w.load_factor()) + role_bonus
+        };
 
-        let chosen_id = if load_a <= load_b { choice_a } else { choice_b };
+        let chosen_id = if score_a >= score_b {
+            choice_a
+        } else {
+            choice_b
+        };
         let chosen_worker = pool.get_worker(chosen_id)?;
         let worker = chosen_worker.read();
 
@@ -460,5 +515,40 @@ mod tests {
 
         // The policy should detect w-01 is saturated and request proactive replication to w-02
         assert_eq!(decision.replicate_to_worker, Some("w-02".to_string()));
+    }
+
+    #[test]
+    fn test_prefill_decode_disaggregated_routing() {
+        let pool = WorkerPool::new();
+        pool.add_worker(WorkerReplica::new_with_role(
+            "w-prefill".into(),
+            "http://prefill".into(),
+            1000,
+            16,
+            crate::shadow_cache::WorkerRole::Prefill,
+        ));
+        pool.add_worker(WorkerReplica::new_with_role(
+            "w-decode".into(),
+            "http://decode".into(),
+            1000,
+            16,
+            crate::shadow_cache::WorkerRole::Decode,
+        ));
+
+        let tree = RadixTree::new(64);
+        let policy = PrefixAwarePolicy::default();
+
+        // 1. Cold 5-block prompt (0% cache hit): should route to Prefill node
+        let cold_prompt = vec![1, 2, 3, 4, 5];
+        let decision_cold = policy.select_worker(&pool, &tree, &cold_prompt).unwrap();
+        assert_eq!(decision_cold.worker_id, "w-prefill");
+
+        // 2. Warm prompt cached on Decode node: should route to Decode node
+        let mut warm_tree = RadixTree::new(64);
+        warm_tree.insert(&cold_prompt, "w-decode");
+        let decision_warm = policy
+            .select_worker(&pool, &warm_tree, &cold_prompt)
+            .unwrap();
+        assert_eq!(decision_warm.worker_id, "w-decode");
     }
 }

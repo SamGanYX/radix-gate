@@ -3,7 +3,7 @@ pub mod worker;
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::Arc;
-pub use worker::WorkerReplica;
+pub use worker::{WorkerReplica, WorkerRole};
 
 /// Manages the pool of active inference worker replicas and their shadow cache states.
 #[derive(Debug, Default)]

@@ -36,6 +36,8 @@ pub struct WorkerSnapshot {
     pub load: usize,
     pub max_concurrency: usize,
     pub kv_utilization: f64,
+    pub role: String,
+    pub role_badge: String,
 }
 
 /// Core interactive TUI runner.
@@ -151,6 +153,16 @@ impl TuiApp {
                     .get("cache_utilization")
                     .and_then(|v| v.as_f64())
                     .unwrap_or(0.0);
+                let role = w
+                    .get("role")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("Unified")
+                    .to_string();
+                let role_badge = w
+                    .get("role_badge")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("[U]")
+                    .to_string();
 
                 list.push(WorkerSnapshot {
                     id,
@@ -158,6 +170,8 @@ impl TuiApp {
                     load,
                     max_concurrency,
                     kv_utilization,
+                    role,
+                    role_badge,
                 });
             }
             list.sort_by(|a, b| a.id.cmp(&b.id));
@@ -426,8 +440,19 @@ impl TuiApp {
                 let load_pct = (w.load as f64 / w.max_concurrency.max(1) as f64 * 100.0).min(100.0);
                 let kv_pct = (w.kv_utilization * 100.0).min(100.0);
 
+                let role_style = match w.role.as_str() {
+                    "Prefill" => Style::default()
+                        .fg(Color::Magenta)
+                        .add_modifier(Modifier::BOLD),
+                    "Decode" => Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                    _ => Style::default().fg(Color::DarkGray),
+                };
+
                 worker_lines.push(Line::from(vec![
                     health_span,
+                    Span::styled(format!("{:<3} ", w.role_badge), role_style),
                     Span::styled(
                         format!("{:<10} ", w.id),
                         Style::default()
@@ -524,6 +549,8 @@ mod tests {
                     "load": 4,
                     "max_concurrency": 32,
                     "is_healthy": true,
+                    "role": "Prefill",
+                    "role_badge": "[P]",
                     "cache_utilization": 0.65
                 },
                 {
@@ -531,6 +558,8 @@ mod tests {
                     "load": 0,
                     "max_concurrency": 32,
                     "is_healthy": false,
+                    "role": "Decode",
+                    "role_badge": "[D]",
                     "cache_utilization": 0.10
                 }
             ]

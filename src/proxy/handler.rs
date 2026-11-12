@@ -132,6 +132,8 @@ pub async fn metrics(State(state): State<Arc<AppState>>, headers: HeaderMap) -> 
                     "id": w.id,
                     "endpoint": w.endpoint_url,
                     "load": w.load(),
+                    "role": format!("{:?}", w.role),
+                    "role_badge": w.role.badge(),
                     "cache_utilization": format!("{:.1}%", w.cache_utilization() * 100.0),
                     "total_routed": w.total_requests_routed,
                     "matched_blocks": w.total_matched_blocks,

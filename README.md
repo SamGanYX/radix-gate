@@ -82,6 +82,7 @@ Observed performance characteristics:
 - **Live Topology Visualizer**: Real-time ASCII prefix tree rendering via HTTP (`/api/v1/tree`) or CLI (`radix-gate tree`).
 - **Interactive Terminal Dashboard (TUI)**: 60-FPS full-terminal cluster dashboard (`radix-gate top`) displaying live cache hit gauges, throughput counters, tree depth, and GPU fleet memory usage.
 - **Proactive Hotspot Replication**: Automatically detects viral prompt prefix branches and pre-warms secondary worker replicas to prevent single-GPU cache saturation.
+- **Prefill-Decode Disaggregation (PD Separation)**: Differentiates compute-dense `Prefill` nodes (FLOPs-bound) from memory-dense `Decode` nodes (KV-bandwidth bound), routing cold massive prompts to prefillers while pinning warm hits to decoders.
 - **High-Concurrency Socket Load Generator**: Built-in async benchmark engine (`radix-gate load-test`) testing real socket connection pools, P50-P99 latencies, and cache hit ratios.
 
 ---
@@ -323,6 +324,16 @@ RadixGate implements **Proactive Hotspot Replication**:
 - The gateway registers the prefix with an idle secondary replica and pre-warms its shadow LRU cache.
 - Subsequent queries sharing the viral prefix benefit from two warm replicas, allowing P2C-Prefix to distribute load across GPUs with **100% cache hits**.
 - When traffic cools, secondary replicas naturally evict the prefix via O(1) LRU capacity limits.
+
+### 9. Prefill-Decode Disaggregation (PD-Aware Scheduling)
+Modern frontier inference architectures (Mooncake, Splitwise, vLLM P/D) disaggregate clusters into:
+- **Prefill Nodes (`WorkerRole::Prefill`)**: Compute-dense hardware (e.g. SXM5 H100s) optimized for high-FLOP matrix multiplication during the initial prompt ingestion phase (TTFT).
+- **Decode Nodes (`WorkerRole::Decode`)**: Memory-bandwidth-dense hardware with large KV pools optimized for autoregressive token generation (TBT).
+- **Unified Nodes (`WorkerRole::Unified`)**: Standard monolithic replicas capable of serving both phases.
+
+RadixGate actively inspects prefix affinity before dispatching to heterogeneous worker roles:
+- **Cold Prompts ($\text{Hit Ratio} < 35\%$)**: Routed to `Prefill` nodes to execute heavy matrix multiplication without degrading the memory bandwidth and decoding latency of in-flight requests.
+- **Warm Prompts ($\text{Hit Ratio} \ge 70\%$)**: Routed directly to `Decode` nodes holding the cached KV prefix, completely bypassing prefill queues.
 
 ---
 

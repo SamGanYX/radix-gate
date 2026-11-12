@@ -13,7 +13,7 @@ pub use balancer::policies::{
 pub use balancer::{RoutingDecision, RoutingPolicy};
 pub use load_test::{LoadTestConfig, LoadTestEndpoint, LoadTestRunner, LoadTestSummary};
 pub use proxy::{AppState, create_router};
-pub use shadow_cache::{WorkerPool, WorkerReplica};
+pub use shadow_cache::{WorkerPool, WorkerReplica, WorkerRole};
 pub use simulator::{BenchmarkConfig, ClusterSimulator, PolicyBenchmarkResult};
 pub use tokenizer::BlockChunker;
 pub use trie::sharded::ShardedRadixTree;
