@@ -5,8 +5,9 @@ use std::sync::Arc;
 use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
+use radix_gate::RoutingPolicy;
 use radix_gate::proxy::{AppState, create_router};
-use radix_gate::shadow_cache::{WorkerPool, WorkerReplica};
+use radix_gate::shadow_cache::{WorkerPool, WorkerReplica, WorkerRole};
 use radix_gate::simulator::{BenchmarkConfig, ClusterSimulator};
 use radix_gate::tokenizer::BlockChunker;
 use radix_gate::trie::RadixTree;
@@ -23,6 +24,9 @@ struct Cli {
 enum Commands {
     /// Start the high-performance reverse proxy server
     Serve {
+        /// Optional path to declarative radixgate.yaml configuration file
+        #[arg(short, long)]
+        config: Option<std::path::PathBuf>,
         #[arg(long, default_value = "127.0.0.1")]
         host: String,
         #[arg(long, default_value_t = 8080)]
@@ -122,6 +126,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ClusterSimulator::render_results_table(&results);
         }
         Commands::Serve {
+            config,
             host,
             port,
             block_size,
@@ -130,11 +135,52 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             gossip_bind,
             peers,
         } => {
-            let radix_tree = Arc::new(RwLock::new(RadixTree::new(block_size)));
-            let worker_pool = Arc::new(WorkerPool::new());
-            let chunker = BlockChunker::new(block_size);
+            let (final_host, final_port, final_block_size, loaded_cfg, cfg_path_opt) =
+                if let Some(ref path) = config {
+                    let cfg = radix_gate::GatewayConfig::load_from_file(path)?;
+                    info!(
+                        "[RadixGate] Loaded declarative configuration from {}",
+                        path.display()
+                    );
+                    (
+                        cfg.server.host.clone(),
+                        cfg.server.port,
+                        cfg.server.block_size,
+                        Some(cfg),
+                        Some(path.clone()),
+                    )
+                } else {
+                    (host, port, block_size, None, None)
+                };
 
-            if let Some(upstream_list) = upstreams {
+            let radix_tree = Arc::new(RwLock::new(RadixTree::new(final_block_size)));
+            let worker_pool = Arc::new(WorkerPool::new());
+            let chunker = BlockChunker::new(final_block_size);
+
+            if let Some(ref cfg) = loaded_cfg {
+                if !cfg.workers.is_empty() {
+                    for w in &cfg.workers {
+                        let role = match w.role.to_lowercase().as_str() {
+                            "prefill" => WorkerRole::Prefill,
+                            "decode" => WorkerRole::Decode,
+                            _ => WorkerRole::Unified,
+                        };
+                        worker_pool.add_worker(WorkerReplica::new_with_role(
+                            w.id.clone(),
+                            w.endpoint_url.clone(),
+                            w.kv_capacity_blocks,
+                            w.max_concurrency,
+                            role,
+                        ));
+                    }
+                } else {
+                    for i in 0..mock_workers {
+                        let id = format!("worker-{:02}", i + 1);
+                        let url = format!("http://127.0.0.1:800{}", i + 1);
+                        worker_pool.add_worker(WorkerReplica::new(id, url, 10_000, 32));
+                    }
+                }
+            } else if let Some(upstream_list) = upstreams {
                 let urls: Vec<&str> = upstream_list
                     .split(',')
                     .map(|s| s.trim())
@@ -152,7 +198,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
-            let mesh_opt = if let Some(bind_str) = gossip_bind {
+            let mesh_opt = if let Some(ref cfg) = loaded_cfg
+                && cfg.mesh.enabled
+            {
+                let bind_addr = cfg
+                    .mesh
+                    .bind_addr
+                    .unwrap_or_else(|| "0.0.0.0:9090".parse().unwrap());
+                let config = radix_gate::MeshConfig {
+                    node_id: cfg
+                        .mesh
+                        .node_id
+                        .clone()
+                        .unwrap_or_else(|| format!("gateway-{}:{}", final_host, final_port)),
+                    bind_addr,
+                    peer_addrs: cfg.mesh.peers.clone(),
+                };
+                let mesh =
+                    Arc::new(radix_gate::GatewayMesh::bind(config, radix_tree.clone()).await?);
+                let _listener = mesh.clone().start_listener();
+                Some(mesh)
+            } else if let Some(bind_str) = gossip_bind {
                 let bind_addr: SocketAddr = bind_str.parse()?;
                 let peer_addrs: Vec<SocketAddr> = peers
                     .unwrap_or_default()
@@ -163,7 +229,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .collect();
 
                 let config = radix_gate::MeshConfig {
-                    node_id: format!("gateway-{}:{}", host, port),
+                    node_id: format!("gateway-{}:{}", final_host, final_port),
                     bind_addr,
                     peer_addrs,
                 };
@@ -180,7 +246,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Some(m) = mesh_opt {
                 app_state_raw = app_state_raw.with_mesh(m);
             }
+            if let Some(cfg) = loaded_cfg {
+                let policy: Arc<dyn RoutingPolicy> = match cfg.balancer.policy.as_str() {
+                    "p2c_prefix" => Arc::new(radix_gate::PowerOfTwoChoicesPolicy::new(
+                        cfg.balancer.saturation_threshold,
+                    )),
+                    _ => Arc::new(radix_gate::PrefixAwarePolicy::new(
+                        cfg.balancer.alpha,
+                        cfg.balancer.beta,
+                    )),
+                };
+                app_state_raw = app_state_raw
+                    .with_policy(policy)
+                    .with_config(cfg, cfg_path_opt);
+            }
             let app_state = Arc::new(app_state_raw);
+
+            #[cfg(unix)]
+            {
+                let state_clone = app_state.clone();
+                tokio::spawn(async move {
+                    use tokio::signal::unix::{SignalKind, signal};
+                    if let Ok(mut hup) = signal(SignalKind::hangup()) {
+                        while hup.recv().await.is_some() {
+                            tracing::info!(
+                                "Received SIGHUP, initiating hot configuration reload..."
+                            );
+                            if let Err(e) = state_clone.reload() {
+                                tracing::warn!("SIGHUP reload failed: {}", e);
+                            }
+                        }
+                    }
+                });
+            }
 
             let _prober = radix_gate::proxy::start_health_prober(
                 worker_pool.clone(),
@@ -189,14 +287,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
 
             let router = create_router(app_state);
-            let addr: SocketAddr = format!("{}:{}", host, port).parse()?;
+            let addr: SocketAddr = format!("{}:{}", final_host, final_port).parse()?;
             info!("[RadixGate] Server listening on http://{}", addr);
             info!(
                 "[RadixGate] Registered {} active inference workers",
                 worker_pool.len()
             );
             info!(
-                "[RadixGate] Endpoints: POST /v1/chat/completions | POST /v1/messages | GET /metrics"
+                "[RadixGate] Endpoints: POST /v1/chat/completions | POST /v1/messages | POST /-/reload | GET /metrics"
             );
 
             let listener = tokio::net::TcpListener::bind(addr).await?;

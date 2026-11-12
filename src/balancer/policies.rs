@@ -156,6 +156,14 @@ impl Default for PowerOfTwoChoicesPolicy {
     }
 }
 
+impl PowerOfTwoChoicesPolicy {
+    pub fn new(saturation_threshold: f64) -> Self {
+        Self {
+            saturation_threshold,
+        }
+    }
+}
+
 impl RoutingPolicy for PowerOfTwoChoicesPolicy {
     fn select_worker(
         &self,

@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -12,6 +13,7 @@ use tracing::{info, warn};
 
 use crate::balancer::RoutingPolicy;
 use crate::balancer::policies::PrefixAwarePolicy;
+use crate::config::GatewayConfig;
 use crate::proxy::streaming::{
     InFlightGuard, TrackedStream, create_anthropic_sse_stream, create_openai_sse_stream,
 };
@@ -25,9 +27,11 @@ pub struct AppState {
     pub radix_tree: Arc<RwLock<RadixTree>>,
     pub worker_pool: Arc<WorkerPool>,
     pub chunker: BlockChunker,
-    pub policy: Arc<dyn RoutingPolicy>,
+    pub policy: Arc<RwLock<Arc<dyn RoutingPolicy>>>,
     pub client: reqwest::Client,
     pub mesh: Option<Arc<crate::mesh::GatewayMesh>>,
+    pub config_path: Option<PathBuf>,
+    pub current_config: Arc<RwLock<GatewayConfig>>,
 
     // Performance metrics
     pub total_requests: AtomicU64,
@@ -45,22 +49,108 @@ impl AppState {
             radix_tree,
             worker_pool,
             chunker,
-            policy: Arc::new(PrefixAwarePolicy::default()),
+            policy: Arc::new(RwLock::new(Arc::new(PrefixAwarePolicy::default()))),
             client: reqwest::Client::builder()
                 .pool_max_idle_per_host(32)
                 .tcp_nodelay(true)
                 .build()
                 .unwrap(),
             mesh: None,
+            config_path: None,
+            current_config: Arc::new(RwLock::new(GatewayConfig::default())),
             total_requests: AtomicU64::new(0),
             total_matched_blocks: AtomicU64::new(0),
             total_prompt_blocks: AtomicU64::new(0),
         }
     }
 
+    pub fn with_policy(self, policy: Arc<dyn RoutingPolicy>) -> Self {
+        *self.policy.write() = policy;
+        self
+    }
+
+    pub fn with_config(mut self, config: GatewayConfig, path: Option<PathBuf>) -> Self {
+        *self.current_config.write() = config;
+        self.config_path = path;
+        self
+    }
+
     pub fn with_mesh(mut self, mesh: Arc<crate::mesh::GatewayMesh>) -> Self {
         self.mesh = Some(mesh);
         self
+    }
+
+    /// Dynamically reloads configuration from disk and updates workers and policies without downtime.
+    pub fn reload(&self) -> Result<String, String> {
+        let Some(ref path) = self.config_path else {
+            return Err(
+                "No config file specified at startup (run with --config <path>)".to_string(),
+            );
+        };
+
+        let new_cfg = GatewayConfig::load_from_file(path)
+            .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
+
+        // 1. Hot-swap routing policy
+        let new_policy: Arc<dyn RoutingPolicy> = match new_cfg.balancer.policy.as_str() {
+            "p2c_prefix" => Arc::new(crate::balancer::policies::PowerOfTwoChoicesPolicy::new(
+                new_cfg.balancer.saturation_threshold,
+            )),
+            _ => Arc::new(PrefixAwarePolicy::new(
+                new_cfg.balancer.alpha,
+                new_cfg.balancer.beta,
+            )),
+        };
+        *self.policy.write() = new_policy;
+
+        // 2. Synchronize worker pool
+        let active_ids: std::collections::HashSet<String> =
+            new_cfg.workers.iter().map(|w| w.id.clone()).collect();
+
+        for w in &new_cfg.workers {
+            let role = match w.role.to_lowercase().as_str() {
+                "prefill" => crate::shadow_cache::WorkerRole::Prefill,
+                "decode" => crate::shadow_cache::WorkerRole::Decode,
+                _ => crate::shadow_cache::WorkerRole::Unified,
+            };
+            if let Some(existing) = self.worker_pool.get_worker(&w.id) {
+                let mut writer = existing.write();
+                writer.endpoint_url = w.endpoint_url.clone();
+                writer.role = role;
+                writer.max_concurrency = w.max_concurrency;
+                writer.is_healthy = true;
+            } else {
+                self.worker_pool
+                    .add_worker(crate::shadow_cache::WorkerReplica::new_with_role(
+                        w.id.clone(),
+                        w.endpoint_url.clone(),
+                        w.kv_capacity_blocks,
+                        w.max_concurrency,
+                        role,
+                    ));
+            }
+        }
+
+        // Prune removed workers
+        let current_ids = self.worker_pool.get_worker_ids();
+        for id in current_ids {
+            if !active_ids.is_empty() && !active_ids.contains(&id) {
+                if let Some(w_arc) = self.worker_pool.get_worker(&id) {
+                    w_arc.write().is_healthy = false;
+                }
+                self.radix_tree.write().evict_worker(&id);
+            }
+        }
+
+        *self.current_config.write() = new_cfg.clone();
+        let msg = format!(
+            "Configuration successfully reloaded from {} (policy: {}, workers: {})",
+            path.display(),
+            new_cfg.balancer.policy,
+            new_cfg.workers.len()
+        );
+        info!("{}", msg);
+        Ok(msg)
     }
 }
 
@@ -246,6 +336,22 @@ pub async fn metrics(State(state): State<Arc<AppState>>, headers: HeaderMap) -> 
     }
 }
 
+/// Dynamically reloads configuration from disk (`POST /-/reload`).
+pub async fn handle_reload(State(state): State<Arc<AppState>>) -> Response {
+    match state.reload() {
+        Ok(msg) => (
+            StatusCode::OK,
+            Json(json!({ "status": "ok", "message": msg })),
+        )
+            .into_response(),
+        Err(err) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "status": "error", "error": err })),
+        )
+            .into_response(),
+    }
+}
+
 /// Primary OpenAI-compatible chat routing handler (`/v1/chat/completions`).
 pub async fn handle_chat_completions(
     State(state): State<Arc<AppState>>,
@@ -279,10 +385,9 @@ async fn handle_routing(
 
     // 2. Select optimal worker via Radix-Aware balancer
     let decision = {
+        let policy = state.policy.read().clone();
         let tree = state.radix_tree.read();
-        state
-            .policy
-            .select_worker(&state.worker_pool, &tree, &block_hashes)
+        policy.select_worker(&state.worker_pool, &tree, &block_hashes)
     };
 
     let decision = match decision {
@@ -1016,5 +1121,118 @@ mod tests {
                 .load(Ordering::SeqCst),
             0
         );
+    }
+
+    #[tokio::test]
+    async fn test_dynamic_config_reload_endpoint() {
+        use crate::config::GatewayConfig;
+        use crate::shadow_cache::WorkerRole;
+
+        let temp_dir = std::env::temp_dir();
+        let config_file = temp_dir.join(format!("radixgate_test_{}.yaml", rand::random::<u32>()));
+
+        let initial_yaml = r#"
+server:
+  port: 8080
+  block_size: 64
+balancer:
+  policy: "prefix_aware"
+  alpha: 0.70
+  beta: 0.30
+workers:
+  - id: "worker-01"
+    endpoint_url: "http://127.0.0.1:8001"
+    kv_capacity_blocks: 1000
+    max_concurrency: 16
+    role: "prefill"
+"#;
+        std::fs::write(&config_file, initial_yaml).unwrap();
+
+        let cfg = GatewayConfig::load_from_file(&config_file).unwrap();
+        let pool = Arc::new(WorkerPool::new());
+        for w in &cfg.workers {
+            pool.add_worker(WorkerReplica::new(
+                w.id.clone(),
+                w.endpoint_url.clone(),
+                w.kv_capacity_blocks,
+                w.max_concurrency,
+            ));
+        }
+        let state = Arc::new(
+            AppState::new(
+                Arc::new(RwLock::new(RadixTree::new(64))),
+                pool.clone(),
+                BlockChunker::new(64),
+            )
+            .with_config(cfg, Some(config_file.clone())),
+        );
+
+        let router = create_router(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        let client = reqwest::Client::new();
+
+        // 1. Check initial state
+        assert_eq!(pool.len(), 1);
+        assert_eq!(state.current_config.read().balancer.alpha, 0.70);
+
+        // 2. Overwrite config file on disk with updated workers and p2c_prefix policy
+        let updated_yaml = r#"
+server:
+  port: 8080
+  block_size: 64
+balancer:
+  policy: "p2c_prefix"
+  saturation_threshold: 0.90
+workers:
+  - id: "worker-01"
+    endpoint_url: "http://127.0.0.1:8001"
+    kv_capacity_blocks: 2000
+    max_concurrency: 32
+    role: "prefill"
+  - id: "worker-02"
+    endpoint_url: "http://127.0.0.1:8002"
+    kv_capacity_blocks: 3000
+    max_concurrency: 64
+    role: "decode"
+"#;
+        std::fs::write(&config_file, updated_yaml).unwrap();
+
+        // 3. Trigger reload via POST /-/reload
+        let reload_resp = client
+            .post(format!("http://127.0.0.1:{}/-/reload", port))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(reload_resp.status(), StatusCode::OK);
+        let reload_json: serde_json::Value = reload_resp.json().await.unwrap();
+        assert_eq!(reload_json["status"], "ok");
+
+        // 4. Assert live state updated dynamically
+        assert_eq!(pool.len(), 2);
+        assert_eq!(state.current_config.read().balancer.policy, "p2c_prefix");
+        assert_eq!(
+            pool.get_worker("worker-02").unwrap().read().role,
+            WorkerRole::Decode
+        );
+
+        // 5. Test invalid config reload returns 400 and preserves existing state
+        std::fs::write(&config_file, "balancer:\n  alpha: 999.0").unwrap();
+        let bad_resp = client
+            .post(format!("http://127.0.0.1:{}/-/reload", port))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(bad_resp.status(), StatusCode::BAD_REQUEST);
+
+        // State remains intact
+        assert_eq!(pool.len(), 2);
+
+        let _ = std::fs::remove_file(config_file);
     }
 }

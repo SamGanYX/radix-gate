@@ -1,4 +1,5 @@
 pub mod balancer;
+pub mod config;
 pub mod load_test;
 pub mod mesh;
 pub mod proxy;
@@ -12,6 +13,7 @@ pub use balancer::policies::{
     LeastLoadedPolicy, PowerOfTwoChoicesPolicy, PrefixAwarePolicy, RoundRobinPolicy,
 };
 pub use balancer::{RoutingDecision, RoutingPolicy};
+pub use config::GatewayConfig;
 pub use load_test::{LoadTestConfig, LoadTestEndpoint, LoadTestRunner, LoadTestSummary};
 pub use mesh::{GatewayMesh, MeshConfig, PrefixGossipMessage};
 pub use proxy::{AppState, create_router};
