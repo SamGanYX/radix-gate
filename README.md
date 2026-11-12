@@ -268,6 +268,34 @@ Available flags:
 - `--shared-prefixes <N>`: Number of distinct shared system prompt archetypes (default: `4`).
 - `--turns <N>`: Sequential conversation turns per session before rotating prefix (default: `3`).
 
+### 7. Docker Compose & Multi-Gateway Mesh
+
+Launch a clustered dual-gateway deployment with automatic UDP peer gossip mesh synchronization enabled:
+
+```bash
+docker compose up --build
+```
+
+- Gateway Node 01: `http://localhost:8080` (Gossip UDP `9090`)
+- Gateway Node 02: `http://localhost:8081` (Gossip UDP `9091`)
+
+Requests sent to Gateway Node 01 are immediately synchronized to Gateway Node 02's local trie in sub-millisecond time.
+
+### 8. vLLM / SGLang Upstream Eviction Sidecar
+
+When physical GPU workers evict blocks under memory pressure, use the Python connector to synchronize state directly:
+
+```python
+from vllm.entrypoints.openai.api_server import app
+from connectors.vllm_sidecar import RadixGateMiddleware, RadixGateSyncClient
+
+# Attach sidecar middleware to inject X-Evicted-Blocks trailers and emit POST /v1/cache/sync
+app.add_middleware(
+    RadixGateMiddleware,
+    sync_client=RadixGateSyncClient("http://radix-gate:8080", "worker-01")
+)
+```
+
 ---
 
 ## Distributed Systems Design & Edge-Case Handling

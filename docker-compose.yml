@@ -1,0 +1,54 @@
+version: "3.8"
+
+services:
+  radix-gate-01:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: radix-gate-01
+    ports:
+      - "8080:8080"
+      - "9090:9090/udp"
+    command:
+      - "serve"
+      - "--host"
+      - "0.0.0.0"
+      - "--port"
+      - "8080"
+      - "--mock-workers"
+      - "4"
+      - "--gossip-bind"
+      - "0.0.0.0:9090"
+      - "--peers"
+      - "radix-gate-02:9091"
+    restart: unless-stopped
+    networks:
+      - radix-net
+
+  radix-gate-02:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: radix-gate-02
+    ports:
+      - "8081:8081"
+      - "9091:9091/udp"
+    command:
+      - "serve"
+      - "--host"
+      - "0.0.0.0"
+      - "--port"
+      - "8081"
+      - "--mock-workers"
+      - "4"
+      - "--gossip-bind"
+      - "0.0.0.0:9091"
+      - "--peers"
+      - "radix-gate-01:9090"
+    restart: unless-stopped
+    networks:
+      - radix-net
+
+networks:
+  radix-net:
+    driver: bridge
