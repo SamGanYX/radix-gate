@@ -12,6 +12,9 @@ use tracing::{info, warn};
 
 use crate::balancer::RoutingPolicy;
 use crate::balancer::policies::PrefixAwarePolicy;
+use crate::proxy::streaming::{
+    InFlightGuard, TrackedStream, create_anthropic_sse_stream, create_openai_sse_stream,
+};
 use crate::proxy::types::ChatRequest;
 use crate::shadow_cache::WorkerPool;
 use crate::tokenizer::BlockChunker;
@@ -480,12 +483,6 @@ async fn handle_routing(
         }
     };
 
-    // Decrement worker active requests
-    current_worker_arc
-        .read()
-        .active_requests
-        .fetch_sub(1, Ordering::SeqCst);
-
     let hit_ratio = if total_blocks > 0 {
         decision.matched_blocks as f64 / total_blocks as f64
     } else {
@@ -528,6 +525,14 @@ async fn handle_routing(
             .await;
     }
 
+    let is_streaming = payload.stream == Some(true)
+        || response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .map(|ct| ct.contains("text/event-stream"))
+            .unwrap_or(false);
+
     // Inject Radix Gateway telemetry headers
     let headers_mut = response.headers_mut();
     headers_mut.insert(
@@ -549,7 +554,17 @@ async fn handle_routing(
         format!("{:.2}", hit_ratio).parse().unwrap(),
     );
 
-    response
+    if is_streaming {
+        headers_mut.insert("Cache-Control", "no-cache, no-transform".parse().unwrap());
+        headers_mut.insert("X-Accel-Buffering", "no".parse().unwrap());
+    }
+
+    // Wrap body in TrackedStream with InFlightGuard: active_requests remains accurately tracked
+    // until the last byte of the stream has been delivered or client aborts.
+    let guard = InFlightGuard::from_existing(current_worker_arc);
+    let (parts, body) = response.into_parts();
+    let tracked_body = Body::from_stream(TrackedStream::new(body.into_data_stream(), guard));
+    Response::from_parts(parts, tracked_body)
 }
 
 /// Attempts to proxy the request directly to a live upstream vLLM/Anthropic worker.
@@ -597,10 +612,16 @@ async fn try_forward_upstream(
 
             let mut response_builder = Response::builder()
                 .status(status)
-                .header("content-type", content_type);
+                .header("content-type", &content_type);
 
             if let Some(evicted) = upstream_resp.headers().get("x-evicted-blocks") {
                 response_builder = response_builder.header("x-evicted-blocks", evicted);
+            }
+
+            if content_type.contains("text/event-stream") || payload.stream == Some(true) {
+                response_builder = response_builder
+                    .header("cache-control", "no-cache, no-transform")
+                    .header("x-accel-buffering", "no");
             }
 
             let body = Body::from_stream(upstream_resp.bytes_stream());
@@ -612,58 +633,84 @@ async fn try_forward_upstream(
     }
 }
 
-/// Generates a realistic mock response matching OpenAI / Anthropic specification.
+/// Generates a realistic mock response matching OpenAI / Anthropic specification,
+/// supporting both full JSON payloads and token-by-token SSE streaming (`stream: true`).
 fn build_mock_response(
     state: &AppState,
     payload: &ChatRequest,
     decision: &crate::balancer::RoutingDecision,
     is_anthropic: bool,
 ) -> Response {
-    let total_blocks = decision.total_blocks;
-    let block_size = state.chunker.block_size;
+    if payload.stream == Some(true) {
+        let block_size = state.chunker.block_size;
+        let req_id = if is_anthropic {
+            format!("msg_{}", uuid_simple())
+        } else {
+            format!("chatcmpl_{}", uuid_simple())
+        };
 
-    let response_body = if is_anthropic {
-        json!({
-            "id": format!("msg_{}", uuid_simple()),
-            "type": "message",
-            "role": "assistant",
-            "content": [{
-                "type": "text",
-                "text": format!("Response generated via RadixGate [routed to {}].", decision.worker_id)
-            }],
-            "model": payload.model,
-            "usage": {
-                "input_tokens": total_blocks * block_size,
-                "output_tokens": 42,
-                "cache_creation_input_tokens": (total_blocks.saturating_sub(decision.matched_blocks)) * block_size,
-                "cache_read_input_tokens": decision.matched_blocks * block_size
-            }
-        })
+        let stream_body = if is_anthropic {
+            let s = create_anthropic_sse_stream(&req_id, &payload.model, decision, block_size);
+            Body::from_stream(s)
+        } else {
+            let s = create_openai_sse_stream(&req_id, &payload.model, decision, block_size);
+            Body::from_stream(s)
+        };
+
+        Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "text/event-stream; charset=utf-8")
+            .header("cache-control", "no-cache, no-transform")
+            .header("x-accel-buffering", "no")
+            .body(stream_body)
+            .unwrap_or_else(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Stream error").into_response())
     } else {
-        json!({
-            "id": format!("chatcmpl_{}", uuid_simple()),
-            "object": "chat.completion",
-            "model": payload.model,
-            "choices": [{
-                "index": 0,
-                "message": {
-                    "role": "assistant",
-                    "content": format!("Response generated via RadixGate [routed to {}].", decision.worker_id)
-                },
-                "finish_reason": "stop"
-            }],
-            "usage": {
-                "prompt_tokens": total_blocks * block_size,
-                "completion_tokens": 42,
-                "total_tokens": (total_blocks * block_size) + 42,
-                "prompt_tokens_details": {
-                    "cached_tokens": decision.matched_blocks * block_size
-                }
-            }
-        })
-    };
+        let total_blocks = decision.total_blocks;
+        let block_size = state.chunker.block_size;
 
-    Json(response_body).into_response()
+        let response_body = if is_anthropic {
+            json!({
+                "id": format!("msg_{}", uuid_simple()),
+                "type": "message",
+                "role": "assistant",
+                "content": [{
+                    "type": "text",
+                    "text": format!("Response generated via RadixGate [routed to {}].", decision.worker_id)
+                }],
+                "model": payload.model,
+                "usage": {
+                    "input_tokens": total_blocks * block_size,
+                    "output_tokens": 42,
+                    "cache_creation_input_tokens": (total_blocks.saturating_sub(decision.matched_blocks)) * block_size,
+                    "cache_read_input_tokens": decision.matched_blocks * block_size
+                }
+            })
+        } else {
+            json!({
+                "id": format!("chatcmpl_{}", uuid_simple()),
+                "object": "chat.completion",
+                "model": payload.model,
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": format!("Response generated via RadixGate [routed to {}].", decision.worker_id)
+                    },
+                    "finish_reason": "stop"
+                }],
+                "usage": {
+                    "prompt_tokens": total_blocks * block_size,
+                    "completion_tokens": 42,
+                    "total_tokens": (total_blocks * block_size) + 42,
+                    "prompt_tokens_details": {
+                        "cached_tokens": decision.matched_blocks * block_size
+                    }
+                }
+            })
+        };
+
+        Json(response_body).into_response()
+    }
 }
 
 fn uuid_simple() -> String {
@@ -788,5 +835,186 @@ mod tests {
             .unwrap();
 
         assert_eq!(dead_resp.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[tokio::test]
+    async fn test_openai_and_anthropic_sse_streaming_mock_mode() {
+        let pool = Arc::new(WorkerPool::new());
+        pool.add_worker(WorkerReplica::new(
+            "worker-01".into(),
+            "http://127.0.0.1:8001".into(), // mock worker port
+            1000,
+            16,
+        ));
+        let state = Arc::new(AppState::new(
+            Arc::new(RwLock::new(RadixTree::new(64))),
+            pool.clone(),
+            BlockChunker::new(64),
+        ));
+        let router = create_router(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        let client = reqwest::Client::new();
+
+        // 1. OpenAI streaming request
+        let openai_req = json!({
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "Explain KV-cache streaming."}],
+            "stream": true
+        });
+        let resp = client
+            .post(format!("http://127.0.0.1:{}/v1/chat/completions", port))
+            .json(&openai_req)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let content_type = resp
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(content_type.contains("text/event-stream"));
+        assert_eq!(
+            resp.headers()
+                .get("x-radix-worker")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "worker-01"
+        );
+        assert_eq!(
+            resp.headers()
+                .get("cache-control")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "no-cache, no-transform"
+        );
+
+        let body_text = resp.text().await.unwrap();
+        assert!(body_text.contains("data: "));
+        assert!(body_text.contains("chat.completion.chunk"));
+        assert!(body_text.contains("data: [DONE]"));
+
+        // 2. Anthropic streaming request
+        let anthropic_req = json!({
+            "model": "claude-3-5-sonnet-20241022",
+            "messages": [{"role": "user", "content": "Explain KV-cache streaming."}],
+            "stream": true
+        });
+        let resp2 = client
+            .post(format!("http://127.0.0.1:{}/v1/messages", port))
+            .json(&anthropic_req)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp2.status(), StatusCode::OK);
+        let content_type2 = resp2
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(content_type2.contains("text/event-stream"));
+        let body_text2 = resp2.text().await.unwrap();
+        assert!(body_text2.contains("event: message_start"));
+        assert!(body_text2.contains("event: content_block_delta"));
+        assert!(body_text2.contains("event: message_stop"));
+
+        // Worker active requests must return to 0 once the stream body is consumed
+        assert_eq!(
+            pool.get_worker("worker-01")
+                .unwrap()
+                .read()
+                .active_requests
+                .load(Ordering::SeqCst),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn test_upstream_sse_streaming_passthrough() {
+        // Setup real upstream server streaming SSE chunks
+        let upstream_app = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(|| async {
+                let stream = futures_util::stream::iter(vec![
+                    Ok::<_, std::io::Error>(bytes::Bytes::from("data: {\"test\":\"chunk1\"}\n\n")),
+                    Ok::<_, std::io::Error>(bytes::Bytes::from("data: {\"test\":\"chunk2\"}\n\n")),
+                    Ok::<_, std::io::Error>(bytes::Bytes::from("data: [DONE]\n\n")),
+                ]);
+                axum::response::Response::builder()
+                    .header("content-type", "text/event-stream")
+                    .body(axum::body::Body::from_stream(stream))
+                    .unwrap()
+            }),
+        );
+        let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_port = upstream_listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let pool = Arc::new(WorkerPool::new());
+        pool.add_worker(WorkerReplica::new(
+            "worker-upstream".into(),
+            format!("http://127.0.0.1:{}", upstream_port),
+            1000,
+            16,
+        ));
+        let state = Arc::new(AppState::new(
+            Arc::new(RwLock::new(RadixTree::new(64))),
+            pool.clone(),
+            BlockChunker::new(64),
+        ));
+        let router = create_router(state);
+        let gw_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let gw_port = gw_listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(gw_listener, router).await.unwrap();
+        });
+
+        let client = reqwest::Client::new();
+        let req = json!({
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "Stream test."}],
+            "stream": true
+        });
+        let resp = client
+            .post(format!("http://127.0.0.1:{}/v1/chat/completions", gw_port))
+            .json(&req)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let content_type = resp
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(content_type.contains("text/event-stream"));
+        let body_text = resp.text().await.unwrap();
+        assert!(body_text.contains("chunk1"));
+        assert!(body_text.contains("chunk2"));
+        assert!(body_text.contains("[DONE]"));
+
+        assert_eq!(
+            pool.get_worker("worker-upstream")
+                .unwrap()
+                .read()
+                .active_requests
+                .load(Ordering::SeqCst),
+            0
+        );
     }
 }

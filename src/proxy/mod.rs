@@ -1,4 +1,5 @@
 pub mod handler;
+pub mod streaming;
 pub mod types;
 
 use axum::Router;
@@ -8,6 +9,7 @@ use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
 pub use handler::AppState;
+pub use streaming::{InFlightGuard, TrackedStream};
 
 /// Spawns a background worker health prober that queries `{worker_url}/health` every interval,
 /// automatically recovering workers once they return 200 OK.
