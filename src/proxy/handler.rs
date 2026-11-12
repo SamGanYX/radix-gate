@@ -292,6 +292,21 @@ async fn handle_routing(
         "Routed request"
     );
 
+    // Proactive Hotspot Replication: pre-warm secondary replica if viral prefix congestion is detected
+    if let Some(ref target_id) = decision.replicate_to_worker
+        && let Some(target_arc) = state.worker_pool.get_worker(target_id)
+    {
+        let mut target_worker = target_arc.write();
+        let _ = target_worker.record_request(&block_hashes, 0);
+        let mut tree = state.radix_tree.write();
+        tree.insert(&block_hashes, target_id);
+        info!(
+            hotspot_from = %decision.worker_id,
+            replicated_to = %target_id,
+            "Proactively replicated viral prefix hotspot to secondary replica"
+        );
+    }
+
     // Record metrics
     state
         .total_matched_blocks

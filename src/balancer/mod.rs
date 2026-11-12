@@ -12,6 +12,9 @@ pub struct RoutingDecision {
     pub total_blocks: usize,
     pub affinity_score: f64,
     pub policy_name: &'static str,
+    /// When high prefix velocity / hotspot is detected on a congested worker,
+    /// suggests a secondary replica to proactively replicate the prefix to.
+    pub replicate_to_worker: Option<String>,
 }
 
 /// Core trait that all cluster load balancing policies implement.

@@ -22,6 +22,8 @@ pub struct MatchResult {
     pub in_flight_matches: HashMap<WorkerId, usize>,
     /// Longest match length across all workers in blocks.
     pub max_matched_blocks: usize,
+    /// Indicates whether any matched branch has high cumulative access velocity / is a hotspot.
+    pub is_hotspot: bool,
 }
 
 impl Default for RadixTree {
@@ -223,6 +225,9 @@ impl RadixTree {
                 }
 
                 matched_depth += match_len;
+                if child.hit_count >= 5 {
+                    result.is_hotspot = true;
+                }
 
                 // Track confirmed cached workers
                 for worker in &child.cached_workers {

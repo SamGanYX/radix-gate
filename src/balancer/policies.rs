@@ -85,6 +85,26 @@ impl RoutingPolicy for PrefixAwarePolicy {
             }
         }
 
+        let replicate_to_worker = if best_matched_blocks > 0 && match_result.is_hotspot {
+            let chosen_load = best_worker_id
+                .as_ref()
+                .and_then(|id| pool.get_worker(id))
+                .map(|w| w.read().load_factor())
+                .unwrap_or(0.0);
+            if chosen_load >= 0.50 {
+                worker_ids
+                    .iter()
+                    .filter(|&id| Some(id) != best_worker_id.as_ref())
+                    .filter_map(|id| pool.get_worker(id).map(|w| (id.clone(), w.read().load())))
+                    .min_by_key(|(_, load)| *load)
+                    .map(|(id, _)| id)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         best_worker_id.map(|w_id| RoutingDecision {
             worker_id: w_id,
             endpoint_url: best_endpoint,
@@ -92,6 +112,7 @@ impl RoutingPolicy for PrefixAwarePolicy {
             total_blocks: prompt_blocks.len(),
             affinity_score: best_score,
             policy_name: "prefix-aware-radix",
+            replicate_to_worker,
         })
     }
 }
@@ -164,7 +185,7 @@ impl RoutingPolicy for PowerOfTwoChoicesPolicy {
 
         // Select candidate subset: prefer warm pool unless empty or heavily saturated
         let candidates = if warm_candidates.len() >= 2 {
-            warm_candidates
+            warm_candidates.clone()
         } else if warm_candidates.len() == 1 {
             let warm_id = &warm_candidates[0];
             let is_saturated = pool
@@ -174,7 +195,7 @@ impl RoutingPolicy for PowerOfTwoChoicesPolicy {
 
             if is_saturated && healthy_pool.len() >= 2 {
                 // Warm worker is congested; sample from healthy pool to trigger dynamic prefix replication
-                healthy_pool
+                healthy_pool.clone()
             } else {
                 // Route directly to the sole warm worker
                 let worker_lock = pool.get_worker(warm_id)?;
@@ -185,6 +206,17 @@ impl RoutingPolicy for PowerOfTwoChoicesPolicy {
                     .copied()
                     .unwrap_or(0);
 
+                let replicate_to_worker = if is_saturated && healthy_pool.len() >= 2 {
+                    healthy_pool
+                        .iter()
+                        .filter(|id| *id != warm_id)
+                        .filter_map(|id| pool.get_worker(id).map(|w| (id.clone(), w.read().load())))
+                        .min_by_key(|(_, load)| *load)
+                        .map(|(id, _)| id)
+                } else {
+                    None
+                };
+
                 return Some(RoutingDecision {
                     worker_id: warm_id.clone(),
                     endpoint_url: worker.endpoint_url.clone(),
@@ -192,10 +224,11 @@ impl RoutingPolicy for PowerOfTwoChoicesPolicy {
                     total_blocks: prompt_blocks.len(),
                     affinity_score: 1.0,
                     policy_name: "p2c-prefix",
+                    replicate_to_worker,
                 });
             }
         } else {
-            healthy_pool
+            healthy_pool.clone()
         };
 
         // Power of Two Choices: sample 2 random distinct candidates from the pool
@@ -222,6 +255,27 @@ impl RoutingPolicy for PowerOfTwoChoicesPolicy {
             .copied()
             .unwrap_or(0);
 
+        let replicate_to_worker = if warm_candidates.len() == 1 && healthy_pool.len() >= 2 {
+            let warm_id = &warm_candidates[0];
+            if pool
+                .get_worker(warm_id)
+                .map(|w| w.read().load_factor() >= 0.70)
+                .unwrap_or(false)
+                || match_result.is_hotspot
+            {
+                healthy_pool
+                    .iter()
+                    .filter(|id| *id != warm_id)
+                    .filter_map(|id| pool.get_worker(id).map(|w| (id.clone(), w.read().load())))
+                    .min_by_key(|(_, load)| *load)
+                    .map(|(id, _)| id)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         Some(RoutingDecision {
             worker_id: chosen_id.clone(),
             endpoint_url: worker.endpoint_url.clone(),
@@ -229,6 +283,7 @@ impl RoutingPolicy for PowerOfTwoChoicesPolicy {
             total_blocks: prompt_blocks.len(),
             affinity_score: 0.5,
             policy_name: "p2c-prefix",
+            replicate_to_worker,
         })
     }
 }
@@ -277,6 +332,7 @@ impl RoutingPolicy for RoundRobinPolicy {
             total_blocks: prompt_blocks.len(),
             affinity_score: 0.0,
             policy_name: "round-robin",
+            replicate_to_worker: None,
         })
     }
 }
@@ -331,6 +387,7 @@ impl RoutingPolicy for LeastLoadedPolicy {
             total_blocks: prompt_blocks.len(),
             affinity_score: 0.0,
             policy_name: "least-loaded",
+            replicate_to_worker: None,
         })
     }
 }
@@ -372,5 +429,36 @@ mod tests {
         // P2C must pick w-02 because both hold the prefix but w-02 has lower active load
         assert_eq!(decision.worker_id, "w-02");
         assert_eq!(decision.matched_blocks, 3);
+    }
+
+    #[test]
+    fn test_proactive_hotspot_replication() {
+        let pool = WorkerPool::new();
+        pool.add_worker(WorkerReplica::new(
+            "w-01".into(),
+            "http://w1".into(),
+            1000,
+            10,
+        ));
+        pool.add_worker(WorkerReplica::new(
+            "w-02".into(),
+            "http://w2".into(),
+            1000,
+            10,
+        ));
+
+        let mut tree = RadixTree::new(64);
+        let prefix = vec![10, 20, 30];
+        tree.insert(&prefix, "w-01");
+
+        // Simulate w-01 being saturated (90% load)
+        let w1 = pool.get_worker("w-01").unwrap();
+        w1.read().active_requests.store(9, Ordering::SeqCst);
+
+        let policy = PowerOfTwoChoicesPolicy::default();
+        let decision = policy.select_worker(&pool, &tree, &prefix).unwrap();
+
+        // The policy should detect w-01 is saturated and request proactive replication to w-02
+        assert_eq!(decision.replicate_to_worker, Some("w-02".to_string()));
     }
 }
