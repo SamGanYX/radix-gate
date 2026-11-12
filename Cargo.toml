@@ -24,3 +24,5 @@ comfy-table = "7.1"
 rand = "0.8"
 chrono = "0.4"
 tiktoken-rs = "0.12.1"
+ratatui = { version = "0.28", default-features = false, features = ["crossterm"] }
+crossterm = { version = "0.28", features = ["event-stream"] }

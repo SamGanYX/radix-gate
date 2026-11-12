@@ -68,6 +68,11 @@ enum Commands {
         #[arg(long, default_value_t = 3)]
         turns: usize,
     },
+    /// Launch the interactive terminal dashboard (Ratatui TUI) monitoring the cluster
+    Top {
+        #[arg(long, default_value = "http://127.0.0.1:8080")]
+        url: String,
+    },
 }
 
 #[tokio::main]
@@ -229,6 +234,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     eprintln!("[Error] Load generator failed: {e}");
                 }
             }
+        }
+        Commands::Top { url } => {
+            let mut app = radix_gate::TuiApp::new(url);
+            app.run().await?;
         }
     }
 

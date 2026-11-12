@@ -5,6 +5,7 @@ pub mod shadow_cache;
 pub mod simulator;
 pub mod tokenizer;
 pub mod trie;
+pub mod tui;
 
 pub use balancer::policies::{
     LeastLoadedPolicy, PowerOfTwoChoicesPolicy, PrefixAwarePolicy, RoundRobinPolicy,
@@ -17,3 +18,4 @@ pub use simulator::{BenchmarkConfig, ClusterSimulator, PolicyBenchmarkResult};
 pub use tokenizer::BlockChunker;
 pub use trie::sharded::ShardedRadixTree;
 pub use trie::{BlockHash, RadixNode, RadixTree, WorkerId};
+pub use tui::{ClusterSnapshot, TuiApp};
