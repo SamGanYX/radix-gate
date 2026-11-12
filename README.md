@@ -80,6 +80,8 @@ Observed performance characteristics:
 - **Zero-Copy Streaming**: Pass-through Server-Sent Events (`text/event-stream`) streaming with injected telemetry headers (`X-Radix-Worker`, `X-Radix-Matched-Blocks`, `X-Radix-Hit-Ratio`).
 - **Telemetry & OpenMetrics Exporter**: Native Prometheus OpenMetrics text format exporter (`/metrics` with auto-negotiation for `text/plain` vs `application/json`) and health checks (`/health`).
 - **Live Topology Visualizer**: Real-time ASCII prefix tree rendering via HTTP (`/api/v1/tree`) or CLI (`radix-gate tree`).
+- **Interactive Terminal Dashboard (TUI)**: 60-FPS full-terminal cluster dashboard (`radix-gate top`) displaying live cache hit gauges, throughput counters, tree depth, and GPU fleet memory usage.
+- **Proactive Hotspot Replication**: Automatically detects viral prompt prefix branches and pre-warms secondary worker replicas to prevent single-GPU cache saturation.
 - **High-Concurrency Socket Load Generator**: Built-in async benchmark engine (`radix-gate load-test`) testing real socket connection pools, P50-P99 latencies, and cache hit ratios.
 
 ---
@@ -214,7 +216,35 @@ ROOT [block_size: 64 tokens]
 └── [0x41f8021c] [Cached: worker-02] (Hits: 110)
 ```
 
-### 5. High-Concurrency Async Socket Load Generator
+### 5. Interactive Terminal Dashboard (`radix-gate top`)
+
+Launch the real-time 60-FPS terminal UI dashboard (built with `ratatui` + `crossterm`) to inspect live cluster health, GPU worker memory utilization, cache hit percentages, and active tree branches:
+
+```bash
+cargo run --release -- top --url http://127.0.0.1:8080
+```
+
+Keybindings:
+- `q` or `Esc`: Cleanly exit dashboard.
+- `r`: Force immediate telemetry poll.
+
+```text
+╭─ RADIX-GATE :: Distributed KV-Cache Gateway & Topology Inspector [http://127.0.0.1:8080] Status: ● CONNECTED ─╮
+│                                                                                                              │
+│ ┌ Global KV Hit Ratio ┐  ┌ Throughput ──────────┐  ┌ Block Cache Match ────┐  ┌ Radix Topology ────────────┐ │
+│ │ [██████████] 86.7%  │  │ 1,240 reqs           │  │ 18,420 / 21,240       │  │ 42 active branches         │ │
+│ └─────────────────────┘  └──────────────────────┘  └───────────────────────┘  └────────────────────────────┘ │
+│                                                                                                              │
+│ ┌ Live Radix Tree Topology ──────────────────────────┐  ┌ Inference Worker Fleet (KV-Cache & In-Flight Load) ┐│
+│ │ ROOT [block_size: 64 tokens]                       │  │ ● OK  worker-01  InFlight:  2/32 ( 6%)  KV: 68.4%   ││
+│ │ ├── [0x8f2a1b9c..0x3e110a72] (4 blk)               │  │    [████████████████        ]                      ││
+│ │ │   [Cached: worker-01, worker-02] (Hits: 412)     │  │ ● OK  worker-02  InFlight:  1/32 ( 3%)  KV: 54.2%   ││
+│ │ │   ├── [0x09a4128f] [Cached: worker-01] (Hits: 92)│  │    [█████████████           ]                      ││
+│ └────────────────────────────────────────────────────┘  └────────────────────────────────────────────────────┘│
+╰─────────────────────────────── [q] Quit  |  [r] Force Refresh  |  RadixGate v0.1.0 ───────────────────────────╯
+```
+
+### 6. High-Concurrency Async Socket Load Generator
 
 Benchmark real socket throughput, TCP connection reuse, P50–P99 latencies, and cache efficiency under multi-turn agent workloads:
 
@@ -284,15 +314,26 @@ RadixGate integrates automated fault tolerance:
 ### 7. Early Prefix Cutoff (Gateway CPU Protection)
 Full BPE tokenization over massive prompts (50k+ tokens) on the gateway hot path introduces multi-millisecond CPU delays. RadixGate enforces an early prefix cutoff (`max_prefix_tokens: 4096`), slicing long prompt strings at clean whitespace boundaries and tokenizing only the prefix depth necessary for cluster routing decisions. Unchunked trailing tokens remain untouched for pass-through to the upstream model, preventing gateway CPU saturation at high QPS.
 
+### 8. Proactive Hotspot Replication (Auto-Duplicating Viral Prefixes)
+In multi-agent clusters, a single popular system prompt (e.g. standard developer instructions or coding schemas) can experience severe traffic bursts. Greedy routing saturates the sole worker holding the prefix, while simple fallback spills excess queries to cold replicas—imposing a 100% cold prefill latency penalty.
+
+RadixGate implements **Proactive Hotspot Replication**:
+- Branch nodes in the Radix Tree track access frequency and access velocity.
+- When a prefix branch's hit frequency crosses a hotspot threshold and its primary worker exceeds bounded load ($L \ge 0.50$), the router flags the decision with `replicate_to_worker`.
+- The gateway registers the prefix with an idle secondary replica and pre-warms its shadow LRU cache.
+- Subsequent queries sharing the viral prefix benefit from two warm replicas, allowing P2C-Prefix to distribute load across GPUs with **100% cache hits**.
+- When traffic cools, secondary replicas naturally evict the prefix via O(1) LRU capacity limits.
+
 ---
 
 ## Architecture Details
 
 - `src/trie/`: Radix tree implementation with branch splitting, atomic in-flight commit, ASCII visualizer, and sharded partitioning (`ShardedRadixTree`).
 - `src/tokenizer.rs`: BPE token chunker (`tiktoken-rs`) with early prefix cutoff and sub-block residual hashing.
-- `src/balancer/`: Multi-objective routing policies (`PrefixAware`, `PowerOfTwoChoices`, `RoundRobin`, `LeastLoaded`).
+- `src/balancer/`: Multi-objective routing policies (`PrefixAware`, `PowerOfTwoChoices`, `RoundRobin`, `LeastLoaded`) with proactive hotspot replication.
 - `src/shadow_cache/`: Worker capacity tracker, circuit breaker state, and O(1) doubly-linked list LRU state mirror.
 - `src/proxy/`: Axum-based HTTP proxy, Prometheus OpenMetrics exporter, automatic failover retries, background health prober, and cache sync ingress.
+- `src/tui.rs`: Real-time 60-FPS terminal dashboard (`radix-gate top`) built with `ratatui` and `crossterm`.
 - `src/load_test.rs`: High-concurrency async socket load generator and percentile latency analyzer.
 - `src/simulator/`: Discrete event benchmark harness with prefill/decode latency model.
 
