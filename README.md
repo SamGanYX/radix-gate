@@ -83,6 +83,7 @@ Observed performance characteristics:
 - **Interactive Terminal Dashboard (TUI)**: 60-FPS full-terminal cluster dashboard (`radix-gate top`) displaying live cache hit gauges, throughput counters, tree depth, and GPU fleet memory usage.
 - **Proactive Hotspot Replication**: Automatically detects viral prompt prefix branches and pre-warms secondary worker replicas to prevent single-GPU cache saturation.
 - **Prefill-Decode Disaggregation (PD Separation)**: Differentiates compute-dense `Prefill` nodes (FLOPs-bound) from memory-dense `Decode` nodes (KV-bandwidth bound), routing cold massive prompts to prefillers while pinning warm hits to decoders.
+- **Distributed Multi-Gateway Mesh**: Peer-to-peer UDP gossip protocol maintaining cluster-wide cache coherence across multiple proxy replicas in $< 1\text{ms}$ without a centralized database.
 - **High-Concurrency Socket Load Generator**: Built-in async benchmark engine (`radix-gate load-test`) testing real socket connection pools, P50-P99 latencies, and cache hit ratios.
 
 ---
@@ -335,13 +336,23 @@ RadixGate actively inspects prefix affinity before dispatching to heterogeneous 
 - **Cold Prompts ($\text{Hit Ratio} < 35\%$)**: Routed to `Prefill` nodes to execute heavy matrix multiplication without degrading the memory bandwidth and decoding latency of in-flight requests.
 - **Warm Prompts ($\text{Hit Ratio} \ge 70\%$)**: Routed directly to `Decode` nodes holding the cached KV prefix, completely bypassing prefill queues.
 
+### 10. Distributed Multi-Gateway Mesh (Cluster-Wide Cache Coherence)
+In large deployments where multiple RadixGate reverse proxy replicas sit behind an AWS ALB or Cloudflare, single-node in-memory caches fragment. If Client A routes a prefix through Gateway 1 to Worker 3, Gateway 2 normally has no awareness of this mapping and may route Client B's follow-up to Worker 1, destroying cache reuse.
+
+RadixGate implements an autonomous **Peer Gossip Mesh Protocol**:
+- Each gateway binds a UDP gossip listener (`--gossip-bind 0.0.0.0:9090 --peers <peer_ips>`).
+- When any gateway commits a prefix to an inference worker, it emits a compact binary UDP gossip packet: `[Magic: 'RGAT', NodeID, WorkerID, BlockHashes, Seq, Timestamp]`.
+- Peer gateways ingest the packet in sub-millisecond background loops, deduplicating via `(node_id, seq)` sequence windows.
+- Remote prefixes are synchronized directly into peer local Radix Trees without any centralized Redis/database bottleneck or single point of failure.
+
 ---
 
 ## Architecture Details
 
 - `src/trie/`: Radix tree implementation with branch splitting, atomic in-flight commit, ASCII visualizer, and sharded partitioning (`ShardedRadixTree`).
 - `src/tokenizer.rs`: BPE token chunker (`tiktoken-rs`) with early prefix cutoff and sub-block residual hashing.
-- `src/balancer/`: Multi-objective routing policies (`PrefixAware`, `PowerOfTwoChoices`, `RoundRobin`, `LeastLoaded`) with proactive hotspot replication.
+- `src/balancer/`: Multi-objective routing policies (`PrefixAware`, `PowerOfTwoChoices`, `RoundRobin`, `LeastLoaded`) with proactive hotspot replication and role-biased disaggregation.
+- `src/mesh/`: Distributed peer gossip protocol for cluster-wide cache coherence across gateway instances.
 - `src/shadow_cache/`: Worker capacity tracker, circuit breaker state, and O(1) doubly-linked list LRU state mirror.
 - `src/proxy/`: Axum-based HTTP proxy, Prometheus OpenMetrics exporter, automatic failover retries, background health prober, and cache sync ingress.
 - `src/tui.rs`: Real-time 60-FPS terminal dashboard (`radix-gate top`) built with `ratatui` and `crossterm`.

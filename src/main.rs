@@ -34,6 +34,12 @@ enum Commands {
         /// Comma-separated list of live upstream worker URLs (e.g. "http://10.0.0.1:8000,http://10.0.0.2:8000")
         #[arg(long)]
         upstreams: Option<String>,
+        /// UDP bind address for distributed gateway mesh peer gossip (e.g. "0.0.0.0:9090")
+        #[arg(long)]
+        gossip_bind: Option<String>,
+        /// Comma-separated list of peer gateway UDP addresses for cluster cache coherence
+        #[arg(long)]
+        peers: Option<String>,
     },
     /// Run the empirical comparative benchmark suite (Round-Robin vs Least-Loaded vs RadixGate)
     Bench {
@@ -121,6 +127,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             block_size,
             mock_workers,
             upstreams,
+            gossip_bind,
+            peers,
         } => {
             let radix_tree = Arc::new(RwLock::new(RadixTree::new(block_size)));
             let worker_pool = Arc::new(WorkerPool::new());
@@ -144,7 +152,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
-            let app_state = Arc::new(AppState::new(radix_tree, worker_pool.clone(), chunker));
+            let mesh_opt = if let Some(bind_str) = gossip_bind {
+                let bind_addr: SocketAddr = bind_str.parse()?;
+                let peer_addrs: Vec<SocketAddr> = peers
+                    .unwrap_or_default()
+                    .split(',')
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty())
+                    .filter_map(|s| s.parse().ok())
+                    .collect();
+
+                let config = radix_gate::MeshConfig {
+                    node_id: format!("gateway-{}:{}", host, port),
+                    bind_addr,
+                    peer_addrs,
+                };
+
+                let mesh =
+                    Arc::new(radix_gate::GatewayMesh::bind(config, radix_tree.clone()).await?);
+                let _listener = mesh.clone().start_listener();
+                Some(mesh)
+            } else {
+                None
+            };
+
+            let mut app_state_raw = AppState::new(radix_tree, worker_pool.clone(), chunker);
+            if let Some(m) = mesh_opt {
+                app_state_raw = app_state_raw.with_mesh(m);
+            }
+            let app_state = Arc::new(app_state_raw);
 
             let _prober = radix_gate::proxy::start_health_prober(
                 worker_pool.clone(),

@@ -24,6 +24,7 @@ pub struct AppState {
     pub chunker: BlockChunker,
     pub policy: Arc<dyn RoutingPolicy>,
     pub client: reqwest::Client,
+    pub mesh: Option<Arc<crate::mesh::GatewayMesh>>,
 
     // Performance metrics
     pub total_requests: AtomicU64,
@@ -47,10 +48,16 @@ impl AppState {
                 .tcp_nodelay(true)
                 .build()
                 .unwrap(),
+            mesh: None,
             total_requests: AtomicU64::new(0),
             total_matched_blocks: AtomicU64::new(0),
             total_prompt_blocks: AtomicU64::new(0),
         }
+    }
+
+    pub fn with_mesh(mut self, mesh: Arc<crate::mesh::GatewayMesh>) -> Self {
+        self.mesh = Some(mesh);
+        self
     }
 }
 
@@ -507,6 +514,12 @@ async fn handle_routing(
                 tree.evict_blocks(&current_worker_id, &blocks);
             }
         }
+    }
+
+    // Broadcast prefix update to distributed gateway mesh peers (if enabled)
+    if let Some(ref mesh) = state.mesh {
+        mesh.broadcast_prefix(&current_worker_id, &block_hashes)
+            .await;
     }
 
     // Inject Radix Gateway telemetry headers
