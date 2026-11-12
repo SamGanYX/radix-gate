@@ -1,0 +1,19 @@
+apiVersion: v2
+name: radix-gate
+description: Production-grade Helm chart for RadixGate - Distributed Prefix-Cache Aware Reverse Proxy for LLM Clusters
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+keywords:
+  - llm
+  - inference
+  - vllm
+  - sglang
+  - prefix-caching
+  - reverse-proxy
+  - kubernetes
+home: https://github.com/SamGanYX/radix-gate
+sources:
+  - https://github.com/SamGanYX/radix-gate
+maintainers:
+  - name: RadixGate Maintainers

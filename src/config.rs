@@ -14,6 +14,8 @@ pub struct GatewayConfig {
     #[serde(default)]
     pub mesh: MeshConfigYaml,
     #[serde(default)]
+    pub discovery: DiscoveryConfigYaml,
+    #[serde(default)]
     pub workers: Vec<WorkerConfigYaml>,
     #[serde(default)]
     pub models: Vec<ModelRouteConfig>,
@@ -140,6 +142,43 @@ pub struct MeshConfigYaml {
     pub bind_addr: Option<SocketAddr>,
     #[serde(default)]
     pub peers: Vec<SocketAddr>,
+}
+
+/// Dynamic Kubernetes / DNS service discovery options.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DiscoveryConfigYaml {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_service_address")]
+    pub service_address: String,
+    #[serde(default = "default_discovery_poll_interval_secs")]
+    pub poll_interval_secs: u64,
+    #[serde(default = "default_kv_capacity")]
+    pub default_kv_capacity_blocks: usize,
+    #[serde(default = "default_max_concurrency")]
+    pub default_max_concurrency: usize,
+    #[serde(default = "default_role")]
+    pub default_role: String,
+}
+
+impl Default for DiscoveryConfigYaml {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            service_address: default_service_address(),
+            poll_interval_secs: default_discovery_poll_interval_secs(),
+            default_kv_capacity_blocks: default_kv_capacity(),
+            default_max_concurrency: default_max_concurrency(),
+            default_role: default_role(),
+        }
+    }
+}
+
+fn default_service_address() -> String {
+    "vllm-headless.default.svc.cluster.local:8000".to_string()
+}
+fn default_discovery_poll_interval_secs() -> u64 {
+    5
 }
 
 /// Declarative worker replica configuration.

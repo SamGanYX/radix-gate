@@ -242,11 +242,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 None
             };
 
-            let mut app_state_raw = AppState::new(radix_tree, worker_pool.clone(), chunker);
+            let mut app_state_raw = AppState::new(radix_tree.clone(), worker_pool.clone(), chunker);
             if let Some(m) = mesh_opt {
                 app_state_raw = app_state_raw.with_mesh(m);
             }
-            if let Some(cfg) = loaded_cfg {
+            if let Some(ref cfg) = loaded_cfg {
                 let policy: Arc<dyn RoutingPolicy> = match cfg.balancer.policy.as_str() {
                     "p2c_prefix" => Arc::new(radix_gate::PowerOfTwoChoicesPolicy::new(
                         cfg.balancer.saturation_threshold,
@@ -258,7 +258,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 };
                 app_state_raw = app_state_raw
                     .with_policy(policy)
-                    .with_config(cfg, cfg_path_opt);
+                    .with_config(cfg.clone(), cfg_path_opt);
             }
             let app_state = Arc::new(app_state_raw);
 
@@ -279,6 +279,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 });
             }
+
+            let _watcher = if let Some(ref cfg) = loaded_cfg
+                && cfg.discovery.enabled
+            {
+                let disc_cfg = radix_gate::DiscoveryConfig {
+                    service_address: cfg.discovery.service_address.clone(),
+                    poll_interval: std::time::Duration::from_secs(cfg.discovery.poll_interval_secs),
+                    default_kv_blocks: cfg.discovery.default_kv_capacity_blocks,
+                    default_max_concurrency: cfg.discovery.default_max_concurrency,
+                    default_role: match cfg.discovery.default_role.to_lowercase().as_str() {
+                        "prefill" => WorkerRole::Prefill,
+                        "decode" => WorkerRole::Decode,
+                        _ => WorkerRole::Unified,
+                    },
+                };
+                let watcher = Arc::new(radix_gate::ServiceDiscoveryWatcher::new(
+                    disc_cfg,
+                    worker_pool.clone(),
+                    radix_tree.clone(),
+                ));
+                info!(
+                    "[RadixGate] Initialized Kubernetes / DNS ServiceDiscoveryWatcher against {}",
+                    cfg.discovery.service_address
+                );
+                Some(watcher.start_watcher())
+            } else {
+                None
+            };
 
             let _prober = radix_gate::proxy::start_health_prober(
                 worker_pool.clone(),

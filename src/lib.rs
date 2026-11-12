@@ -1,5 +1,6 @@
 pub mod balancer;
 pub mod config;
+pub mod discovery;
 pub mod load_test;
 pub mod mesh;
 pub mod proxy;
@@ -14,6 +15,7 @@ pub use balancer::policies::{
 };
 pub use balancer::{RoutingDecision, RoutingPolicy};
 pub use config::GatewayConfig;
+pub use discovery::{DiscoveryConfig, ServiceDiscoveryWatcher};
 pub use load_test::{LoadTestConfig, LoadTestEndpoint, LoadTestRunner, LoadTestSummary};
 pub use mesh::{GatewayMesh, MeshConfig, PrefixGossipMessage};
 pub use proxy::{AppState, create_router};

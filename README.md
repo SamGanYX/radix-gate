@@ -85,6 +85,8 @@ Observed performance characteristics:
 - **Prefill-Decode Disaggregation (PD Separation)**: Differentiates compute-dense `Prefill` nodes (FLOPs-bound) from memory-dense `Decode` nodes (KV-bandwidth bound), routing cold massive prompts to prefillers while pinning warm hits to decoders.
 - **Distributed Multi-Gateway Mesh**: Peer-to-peer UDP gossip protocol maintaining cluster-wide cache coherence across multiple proxy replicas in $< 1\text{ms}$ without a centralized database.
 - **High-Concurrency Socket Load Generator**: Built-in async benchmark engine (`radix-gate load-test`) testing real socket connection pools, P50-P99 latencies, and cache hit ratios.
+- **Declarative YAML Engine & Zero-Downtime Hot-Reload**: Declarative `radixgate.yaml` configuration engine with atomic dynamic policy reloading via HTTP `POST /-/reload` or Unix `SIGHUP`.
+- **Kubernetes Service Discovery & Helm Chart**: Automated reconciliation with upstream headless GPU services (`vllm-headless`), auto-registering scaled pods and evicting scaled-down nodes with production Helm v3 packaging.
 
 ---
 
@@ -332,6 +334,36 @@ Pre-built multi-platform container images are automatically published via GitHub
 docker pull ghcr.io/samganyx/radix-gate:latest
 docker run -p 8080:8080 ghcr.io/samganyx/radix-gate:latest serve --mock-workers 4
 ```
+
+### 11. Declarative Configuration & Zero-Downtime Hot-Reload
+
+RadixGate supports enterprise YAML configuration (`config/radixgate.example.yaml`) managing chunking parameters, load balancing policies, mesh peering, and discovery:
+
+```bash
+# Start gateway with declarative YAML configuration
+cargo run --release -- --config config/radixgate.example.yaml
+```
+
+Update balancing parameters, timeouts, or worker weights at runtime with **zero downtime**:
+- **HTTP Reload Endpoint**: `curl -X POST http://localhost:8080/-/reload`
+- **POSIX Signal Listener**: `kill -HUP <radixgate_pid>` (triggers atomic thread-safe `Arc<RwLock<RoutingPolicy>>` swap)
+
+### 12. Kubernetes Service Discovery & Production Helm Chart
+
+Deploy RadixGate natively to Kubernetes with automated Horizontal Pod Autoscaling (HPA) reconciliation and headless service discovery:
+
+```bash
+# Deploy using the production Helm v3 chart
+helm install radix-gate ./charts/radix-gate \
+  --set radixConfig.discovery.enabled=true \
+  --set radixConfig.discovery.service_address="vllm-headless.default.svc.cluster.local:8000"
+```
+
+**Key Kubernetes Capabilities:**
+- **Headless DNS Reconciler**: Periodically resolves upstream headless services (e.g., `vllm-headless:8000`) via standard non-blocking DNS queries—requiring **zero RBAC cluster permissions**.
+- **Scale-Up Detection**: Newly spawned GPU pods are automatically registered with full shadow LRU tracking without restarting the gateway.
+- **Scale-Down & Eviction Safety**: Terminated or scaled-down pods are immediately removed from the active worker pool and pruned from the Radix Tree, preventing cache hallucination.
+- **Native Health & Observability**: Integrated `/health` liveness/readiness probes and optional Prometheus Operator `PodMonitor` resource.
 
 ---
 

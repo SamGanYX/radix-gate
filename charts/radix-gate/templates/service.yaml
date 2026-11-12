@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "radix-gate.fullname" . }}
+  labels:
+    {{- include "radix-gate.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.service.type }}
+  ports:
+    - port: {{ .Values.service.port }}
+      targetPort: {{ .Values.service.targetPort }}
+      protocol: TCP
+      name: http-gateway
+  selector:
+    {{- include "radix-gate.selectorLabels" . | nindent 4 }}

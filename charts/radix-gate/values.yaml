@@ -1,0 +1,105 @@
+replicaCount: 2
+
+image:
+  repository: ghcr.io/samganyx/radix-gate
+  pullPolicy: IfNotPresent
+  tag: "0.1.0"
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""
+
+podAnnotations:
+  prometheus.io/scrape: "true"
+  prometheus.io/port: "8080"
+  prometheus.io/path: "/metrics"
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+service:
+  type: ClusterIP
+  port: 8080
+  targetPort: 8080
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts:
+    - host: radix-gate.local
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+
+resources:
+  limits:
+    cpu: 2000m
+    memory: 2Gi
+  requests:
+    cpu: 250m
+    memory: 512Mi
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# RadixGate Declarative Engine Configuration
+radixConfig:
+  gateway:
+    host: "0.0.0.0"
+    port: 8080
+    log_level: "info"
+    mock_upstream: false
+
+  chunking:
+    chunk_size: 64
+    tokenizer_model: "gpt-4"
+
+  balancer:
+    policy: "prefix_aware" # Options: prefix_aware, p2c_prefix
+    alpha: 0.7
+    beta: 0.3
+    saturation_threshold: 0.85
+
+  mesh:
+    enabled: false
+    node_id: "radix-node-1"
+    listen_port: 9000
+    seed_nodes: []
+
+  # Kubernetes headless service discovery for automatic pod scaling & eviction
+  discovery:
+    enabled: true
+    service_address: "vllm-headless.default.svc.cluster.local:8000"
+    poll_interval_secs: 5
+    default_kv_capacity_blocks: 4096
+    default_max_concurrency: 64
+    default_role: "unified"
+
+  # Static workers (fallback if discovery is disabled or for hybrid clusters)
+  workers: []
+
+# Prometheus Operator metrics integration
+metrics:
+  podMonitor:
+    enabled: false
+    interval: 15s
+    scrapeTimeout: 10s
+    labels: {}
