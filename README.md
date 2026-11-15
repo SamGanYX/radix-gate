@@ -283,19 +283,41 @@ docker compose up --build
 
 Requests sent to Gateway Node 01 are immediately synchronized to Gateway Node 02's local trie in sub-millisecond time.
 
-### 8. vLLM / SGLang Upstream Eviction Sidecar
+### 8. Python Client SDK & Inference Engine Sidecar (`radixgate`)
 
-When physical GPU workers evict blocks under memory pressure, use the Python connector to synchronize state directly:
+The official `radixgate` Python package (`pip install radixgate`) provides both client routing inspection and upstream engine middleware for vLLM & SGLang:
+
+```bash
+pip install radixgate
+```
+
+#### Client SDK (Inspecting Prefix Hit Rates)
+```python
+from radixgate import RadixGateClient
+
+client = RadixGateClient("http://localhost:8080")
+resp, meta = client.chat_completion({
+    "model": "gpt-4o",
+    "messages": [
+        {"role": "system", "content": "You are a code reviewer."},
+        {"role": "user", "content": "Review this patch."}
+    ]
+})
+
+print(f"Routed Worker: {meta.worker_id}")
+print(f"Warm Prefix Blocks: {meta.matched_blocks}/{meta.prompt_blocks}")
+print(f"Instantaneous Hit Ratio: {meta.cache_hit_ratio * 100:.1f}%")
+```
+
+#### Upstream Eviction Middleware (vLLM & SGLang)
+When physical GPU workers evict blocks under VRAM memory pressure, the middleware synchronizes state to prevent cache hallucination:
 
 ```python
 from vllm.entrypoints.openai.api_server import app
-from connectors.vllm_sidecar import RadixGateMiddleware, RadixGateSyncClient
+from radixgate.vllm import attach_vllm_app
 
-# Attach sidecar middleware to inject X-Evicted-Blocks trailers and emit POST /v1/cache/sync
-app.add_middleware(
-    RadixGateMiddleware,
-    sync_client=RadixGateSyncClient("http://radix-gate:8080", "worker-01")
-)
+# Automatically injects X-Evicted-Blocks headers and flushes POST /v1/cache/sync batches
+attach_vllm_app(app, gateway_url="http://radix-gate:8080", worker_id="vllm-worker-01")
 ```
 
 ### 9. True Bidirectional Server-Sent Events (SSE) Streaming
