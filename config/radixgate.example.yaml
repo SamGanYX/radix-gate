@@ -53,3 +53,19 @@ models:
     allowed_workers:
       - "worker-prefill-01"
       - "worker-decode-01"
+
+# Kubernetes headless service discovery for automatic pod scaling & eviction
+discovery:
+  enabled: false
+  service_address: "vllm-headless.default.svc.cluster.local:8000"
+  poll_interval_secs: 5
+  default_kv_capacity_blocks: 4096
+  default_max_concurrency: 64
+  default_role: "unified"
+
+# Distributed tracing & W3C Trace Context propagation
+tracing:
+  enabled: true
+  service_name: "radix-gate"
+  endpoint: "http://localhost:4317"
+  sample_rate: 1.0

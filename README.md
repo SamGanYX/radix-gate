@@ -87,6 +87,8 @@ Observed performance characteristics:
 - **High-Concurrency Socket Load Generator**: Built-in async benchmark engine (`radix-gate load-test`) testing real socket connection pools, P50-P99 latencies, and cache hit ratios.
 - **Declarative YAML Engine & Zero-Downtime Hot-Reload**: Declarative `radixgate.yaml` configuration engine with atomic dynamic policy reloading via HTTP `POST /-/reload` or Unix `SIGHUP`.
 - **Kubernetes Service Discovery & Helm Chart**: Automated reconciliation with upstream headless GPU services (`vllm-headless`), auto-registering scaled pods and evicting scaled-down nodes with production Helm v3 packaging.
+- **Official Python Client SDK & Inference Engine Sidecar**: Pip-installable `radixgate` package with async client, cache-hit telemetry models, and FastAPI/ASGI middleware for vLLM & SGLang.
+- **OpenTelemetry Distributed Tracing & W3C Trace Context**: Seamless traceparent propagation linking gateway routing decisions to upstream GPU kernel executions with `X-Radix-Trace-Id` headers.
 
 ---
 
@@ -386,6 +388,22 @@ helm install radix-gate ./charts/radix-gate \
 - **Scale-Up Detection**: Newly spawned GPU pods are automatically registered with full shadow LRU tracking without restarting the gateway.
 - **Scale-Down & Eviction Safety**: Terminated or scaled-down pods are immediately removed from the active worker pool and pruned from the Radix Tree, preventing cache hallucination.
 - **Native Health & Observability**: Integrated `/health` liveness/readiness probes and optional Prometheus Operator `PodMonitor` resource.
+
+### 13. OpenTelemetry Distributed Tracing & W3C Trace Context Propagation
+
+RadixGate natively implements W3C Trace Context (`traceparent: 00-{trace_id}-{span_id}-{flags}`) propagation:
+
+```bash
+# Client request with distributed trace context
+curl -X POST http://localhost:8080/v1/chat/completions \
+  -H "traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01" \
+  -H "Content-Type: application/json" \
+  -d '{"model": "gpt-4o", "messages": [{"role": "user", "content": "Trace test."}]}'
+```
+
+- **Upstream Span Linking**: Injects child `traceparent` headers into upstream vLLM/SGLang requests, creating an unbroken trace from client through proxy to GPU kernel execution.
+- **Trace ID Response Header**: Returns `X-Radix-Trace-Id` on all responses for instant lookup in Grafana Tempo, Jaeger, and Datadog.
+- **Configurable Sampling**: Declarative `tracing.sample_rate` and `tracing.service_name` in `radixgate.yaml`.
 
 ---
 

@@ -7,6 +7,7 @@ pub mod proxy;
 pub mod shadow_cache;
 pub mod simulator;
 pub mod tokenizer;
+pub mod tracing;
 pub mod trie;
 pub mod tui;
 
@@ -22,6 +23,7 @@ pub use proxy::{AppState, create_router};
 pub use shadow_cache::{WorkerPool, WorkerReplica, WorkerRole};
 pub use simulator::{BenchmarkConfig, ClusterSimulator, PolicyBenchmarkResult};
 pub use tokenizer::BlockChunker;
+pub use tracing::TraceContext;
 pub use trie::sharded::ShardedRadixTree;
 pub use trie::{BlockHash, RadixNode, RadixTree, WorkerId};
 pub use tui::{ClusterSnapshot, TuiApp};

@@ -19,6 +19,8 @@ pub struct GatewayConfig {
     pub workers: Vec<WorkerConfigYaml>,
     #[serde(default)]
     pub models: Vec<ModelRouteConfig>,
+    #[serde(default)]
+    pub tracing: TracingConfigYaml,
 }
 
 impl GatewayConfig {
@@ -43,6 +45,9 @@ impl GatewayConfig {
         }
         if !(0.0..=1.0).contains(&self.balancer.saturation_threshold) {
             return Err("balancer.saturation_threshold must be between 0.0 and 1.0".to_string());
+        }
+        if !(0.0..=1.0).contains(&self.tracing.sample_rate) {
+            return Err("tracing.sample_rate must be between 0.0 and 1.0".to_string());
         }
         for w in &self.workers {
             if w.id.trim().is_empty() {
@@ -212,6 +217,40 @@ pub struct ModelRouteConfig {
     pub allowed_workers: Vec<String>,
 }
 
+/// Distributed tracing options.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TracingConfigYaml {
+    #[serde(default = "default_tracing_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_service_name")]
+    pub service_name: String,
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    #[serde(default = "default_sample_rate")]
+    pub sample_rate: f64,
+}
+
+impl Default for TracingConfigYaml {
+    fn default() -> Self {
+        Self {
+            enabled: default_tracing_enabled(),
+            service_name: default_service_name(),
+            endpoint: None,
+            sample_rate: default_sample_rate(),
+        }
+    }
+}
+
+fn default_tracing_enabled() -> bool {
+    true
+}
+fn default_service_name() -> String {
+    "radix-gate".to_string()
+}
+fn default_sample_rate() -> f64 {
+    1.0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -254,6 +293,11 @@ workers:
   - id: "worker-02"
     endpoint_url: "http://10.0.0.2:8000"
     role: "decode"
+
+tracing:
+  enabled: true
+  service_name: "radix-gate-prod"
+  sample_rate: 0.5
 "#;
         let cfg: GatewayConfig = serde_yaml::from_str(yaml).unwrap();
         assert!(cfg.validate().is_ok());
@@ -265,6 +309,9 @@ workers:
         assert_eq!(cfg.workers[0].role, "prefill");
         assert_eq!(cfg.workers[1].role, "decode");
         assert_eq!(cfg.workers[1].max_concurrency, 32);
+        assert!(cfg.tracing.enabled);
+        assert_eq!(cfg.tracing.service_name, "radix-gate-prod");
+        assert_eq!(cfg.tracing.sample_rate, 0.5);
     }
 
     #[test]

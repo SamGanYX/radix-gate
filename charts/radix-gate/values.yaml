@@ -96,6 +96,13 @@ radixConfig:
   # Static workers (fallback if discovery is disabled or for hybrid clusters)
   workers: []
 
+  # Distributed tracing & W3C Trace Context propagation
+  tracing:
+    enabled: true
+    service_name: "radix-gate"
+    endpoint: "http://otel-collector.monitoring.svc.cluster.local:4317"
+    sample_rate: 1.0
+
 # Prometheus Operator metrics integration
 metrics:
   podMonitor:

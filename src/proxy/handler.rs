@@ -378,6 +378,33 @@ async fn handle_routing(
 ) -> Response {
     state.total_requests.fetch_add(1, Ordering::Relaxed);
 
+    // Distributed Tracing: Extract W3C traceparent or generate new root trace context
+    let trace_ctx = headers
+        .get("traceparent")
+        .and_then(|h| h.to_str().ok())
+        .and_then(crate::tracing::TraceContext::from_traceparent)
+        .unwrap_or_else(|| {
+            let sample = {
+                let cfg = state.current_config.read();
+                if cfg.tracing.enabled {
+                    rand::random::<f64>() < cfg.tracing.sample_rate
+                } else {
+                    false
+                }
+            };
+            crate::tracing::TraceContext::new_root(sample)
+        });
+
+    let _span = tracing::info_span!(
+        "radixgate.request",
+        trace_id = %trace_ctx.trace_id,
+        span_id = %trace_ctx.span_id,
+        model = %payload.model,
+        is_anthropic,
+        stream = payload.stream.unwrap_or(false),
+    );
+    let _enter = _span.enter();
+
     // 1. Extract prompt and compute token block hashes
     let prompt_text = payload.extract_prompt_text();
     let block_hashes = state.chunker.chunk_text(&prompt_text);
@@ -475,6 +502,7 @@ async fn handle_routing(
             &headers,
             &payload,
             is_anthropic,
+            &trace_ctx,
         )
         .await
         {
@@ -530,6 +558,7 @@ async fn handle_routing(
                             &headers,
                             &payload,
                             is_anthropic,
+                            &trace_ctx,
                         )
                         .await
                         {
@@ -658,6 +687,20 @@ async fn handle_routing(
         "X-Radix-Hit-Ratio",
         format!("{:.2}", hit_ratio).parse().unwrap(),
     );
+    headers_mut.insert(
+        "X-Radix-Trace-Id",
+        trace_ctx
+            .trace_id
+            .parse()
+            .unwrap_or_else(|_| "unknown".parse().unwrap()),
+    );
+    headers_mut.insert(
+        "traceparent",
+        trace_ctx
+            .to_traceparent()
+            .parse()
+            .unwrap_or_else(|_| "unknown".parse().unwrap()),
+    );
 
     if is_streaming {
         headers_mut.insert("Cache-Control", "no-cache, no-transform".parse().unwrap());
@@ -679,6 +722,7 @@ async fn try_forward_upstream(
     client_headers: &HeaderMap,
     payload: &ChatRequest,
     is_anthropic: bool,
+    trace_ctx: &crate::tracing::TraceContext,
 ) -> Result<Response, String> {
     let path = if is_anthropic {
         "/v1/messages"
@@ -688,6 +732,10 @@ async fn try_forward_upstream(
     let target_url = format!("{}{}", endpoint_base.trim_end_matches('/'), path);
 
     let mut req_builder = client.post(&target_url).json(payload);
+
+    // Propagate W3C distributed traceparent to upstream engine
+    let child_span = trace_ctx.child_span();
+    req_builder = req_builder.header("traceparent", child_span.to_traceparent());
 
     if let Some(auth) = client_headers.get("authorization") {
         req_builder = req_builder.header("authorization", auth);
@@ -1234,5 +1282,79 @@ workers:
         assert_eq!(pool.len(), 2);
 
         let _ = std::fs::remove_file(config_file);
+    }
+
+    #[tokio::test]
+    async fn test_distributed_tracing_w3c_traceparent_propagation() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(1);
+
+        let upstream_app = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(move |headers: HeaderMap| {
+                let tx = tx.clone();
+                async move {
+                    if let Some(tp) = headers.get("traceparent") {
+                        let _ = tx.send(tp.to_str().unwrap().to_string()).await;
+                    }
+                    (StatusCode::OK, Json(json!({"choices": []})))
+                }
+            }),
+        );
+        let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_port = upstream_listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let pool = Arc::new(WorkerPool::new());
+        pool.add_worker(WorkerReplica::new(
+            "worker-trace".into(),
+            format!("http://127.0.0.1:{}", upstream_port),
+            1000,
+            16,
+        ));
+        let state = Arc::new(AppState::new(
+            Arc::new(RwLock::new(RadixTree::new(64))),
+            pool.clone(),
+            BlockChunker::new(64),
+        ));
+        let router = create_router(state);
+        let gw_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let gw_port = gw_listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(gw_listener, router).await.unwrap();
+        });
+
+        let client = reqwest::Client::new();
+        let client_traceparent = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+        let req = json!({
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "Trace test."}]
+        });
+        let resp = client
+            .post(format!("http://127.0.0.1:{}/v1/chat/completions", gw_port))
+            .header("traceparent", client_traceparent)
+            .json(&req)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Verify gateway returns X-Radix-Trace-Id and traceparent to client
+        let trace_id_header = resp
+            .headers()
+            .get("x-radix-trace-id")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(trace_id_header, "4bf92f3577b34da6a3ce929d0e0e4736");
+
+        let gw_traceparent = resp.headers().get("traceparent").unwrap().to_str().unwrap();
+        assert!(gw_traceparent.starts_with("00-4bf92f3577b34da6a3ce929d0e0e4736-"));
+
+        // Verify upstream received child span with the exact same trace ID
+        let upstream_traceparent = rx.recv().await.unwrap();
+        assert!(upstream_traceparent.starts_with("00-4bf92f3577b34da6a3ce929d0e0e4736-"));
     }
 }
