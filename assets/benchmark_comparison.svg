@@ -1,0 +1,111 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 380" width="100%" height="100%">
+  <defs>
+    <linearGradient id="bgGrad2" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0b0f19"/>
+      <stop offset="100%" stop-color="#111827"/>
+    </linearGradient>
+    <linearGradient id="barRed" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#ef4444"/>
+      <stop offset="100%" stop-color="#f87171"/>
+    </linearGradient>
+    <linearGradient id="barEmerald" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#059669"/>
+      <stop offset="100%" stop-color="#10b981"/>
+    </linearGradient>
+    <linearGradient id="barBlue" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#2563eb"/>
+      <stop offset="100%" stop-color="#38bdf8"/>
+    </linearGradient>
+    <filter id="softGlow">
+      <feGaussianBlur stdDeviation="4" result="coloredBlur"/>
+      <feMerge>
+        <feMergeNode in="coloredBlur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+
+  <style>
+    .font-mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Courier New", monospace; }
+    .font-sans { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+    .title { font-size: 16px; font-weight: 700; fill: #f8fafc; }
+    .subtitle { font-size: 12px; fill: #94a3b8; }
+    .axis-label { font-size: 12px; fill: #cbd5e1; font-weight: 600; }
+    .val-label { font-size: 14px; font-weight: 700; }
+    .badge { font-size: 11px; font-weight: 700; }
+  </style>
+
+  <!-- Container -->
+  <rect width="960" height="380" rx="12" fill="url(#bgGrad2)" stroke="#1e293b" stroke-width="1.5"/>
+
+  <!-- Header -->
+  <text x="32" y="38" class="font-sans title">RadixGate Empirical Inference Benchmark: Prefix-Aware vs Generic L7</text>
+  <text x="32" y="58" class="font-sans subtitle">Workload: 1,000 multi-turn agent requests across 4 workers under constrained KV capacity (150 blocks/worker)</text>
+
+  <!-- Section 1: Aggregate Prefill Compute (Left Chart) -->
+  <g transform="translate(32, 90)">
+    <rect width="428" height="254" rx="8" fill="#070a13" stroke="#1e293b" stroke-width="1"/>
+    <text x="18" y="28" class="font-sans" font-size="13" font-weight="700" fill="#e2e8f0">Total GPU Prefill Compute Time (Lower is Better)</text>
+    <text x="18" y="44" class="font-sans" font-size="11" fill="#64748b">Cumulative seconds spent by GPU kernels recalculating prompt matrices</text>
+
+    <!-- Bar 1: Round Robin -->
+    <text x="18" y="86" class="font-mono axis-label">Round-Robin (Generic L7)</text>
+    <rect x="18" y="96" width="392" height="26" rx="4" fill="#1e293b"/>
+    <rect x="18" y="96" width="370" height="26" rx="4" fill="url(#barRed)"/>
+    <text x="398" y="114" text-anchor="end" class="font-mono val-label" fill="#ffffff">11.62 s</text>
+
+    <!-- Bar 2: Least Loaded -->
+    <text x="18" y="148" class="font-mono axis-label">Least-Loaded (Prefix-Blind)</text>
+    <rect x="18" y="158" width="392" height="26" rx="4" fill="#1e293b"/>
+    <rect x="18" y="158" width="368" height="26" rx="4" fill="#64748b"/>
+    <text x="398" y="176" text-anchor="end" class="font-mono val-label" fill="#ffffff">11.57 s</text>
+
+    <!-- Bar 3: RadixGate -->
+    <text x="18" y="210" class="font-mono axis-label" fill="#34d399">RadixGate (Prefix-Aware)</text>
+    <rect x="18" y="220" width="392" height="26" rx="4" fill="#1e293b"/>
+    <rect x="18" y="220" width="180" height="26" rx="4" fill="url(#barEmerald)" filter="url(#softGlow)"/>
+    <text x="210" y="238" class="font-mono val-label" fill="#34d399">5.67 s</text>
+    <rect x="268" y="222" width="138" height="22" rx="4" fill="#065f46"/>
+    <text x="337" y="237" text-anchor="middle" class="font-sans badge" fill="#6ee7b7">51.6% COMPUTE SAVED</text>
+  </g>
+
+  <!-- Section 2: Mean & P95 TTFT Latency (Right Chart) -->
+  <g transform="translate(492, 90)">
+    <rect width="436" height="254" rx="8" fill="#070a13" stroke="#1e293b" stroke-width="1"/>
+    <text x="18" y="28" class="font-sans" font-size="13" font-weight="700" fill="#e2e8f0">Time-To-First-Token (TTFT) Latency Distribution</text>
+    <text x="18" y="44" class="font-sans" font-size="11" fill="#64748b">Measured response delay before first autoregressive token is emitted</text>
+
+    <!-- Comparison Group: Round Robin -->
+    <g transform="translate(18, 70)">
+      <text x="0" y="16" class="font-mono axis-label">Round-Robin (Generic L7)</text>
+      <text x="180" y="16" class="font-mono" font-size="12" fill="#94a3b8">Mean: <tspan fill="#f87171" font-weight="700">11.62 ms</tspan> | P95: <tspan fill="#f87171">33.60 ms</tspan></text>
+      <!-- Mean Bar -->
+      <rect x="0" y="26" width="400" height="18" rx="3" fill="#1e293b"/>
+      <rect x="0" y="26" width="140" height="18" rx="3" fill="#ef4444"/>
+      <!-- P95 Marker -->
+      <rect x="0" y="48" width="400" height="8" rx="2" fill="#1e293b"/>
+      <rect x="0" y="48" width="336" height="8" rx="2" fill="#7f1d1d"/>
+    </g>
+
+    <!-- Comparison Group: RadixGate -->
+    <g transform="translate(18, 150)">
+      <text x="0" y="16" class="font-mono axis-label" fill="#38bdf8">RadixGate (Prefix-Aware)</text>
+      <text x="180" y="16" class="font-mono" font-size="12" fill="#94a3b8">Mean: <tspan fill="#38bdf8" font-weight="700">5.67 ms</tspan> | P95: <tspan fill="#38bdf8">20.24 ms</tspan></text>
+      <!-- Mean Bar -->
+      <rect x="0" y="26" width="400" height="18" rx="3" fill="#1e293b"/>
+      <rect x="0" y="26" width="68" height="18" rx="3" fill="url(#barBlue)" filter="url(#softGlow)"/>
+      <rect x="80" y="24" width="108" height="22" rx="4" fill="#0c4a6e"/>
+      <text x="134" y="39" text-anchor="middle" class="font-sans badge" fill="#7dd3fc">2.05x FASTER</text>
+      <!-- P95 Marker -->
+      <rect x="0" y="48" width="400" height="8" rx="2" fill="#1e293b"/>
+      <rect x="0" y="48" width="202" height="8" rx="2" fill="#0369a1"/>
+    </g>
+
+    <!-- Cache hit callout -->
+    <g transform="translate(18, 222)">
+      <text x="0" y="12" class="font-mono" font-size="11" fill="#94a3b8">
+        Cache Hit Rate: <tspan fill="#f87171">69.3% (Generic)</tspan> ➔ <tspan fill="#34d399" font-weight="700">86.8% (RadixGate)</tspan> <tspan fill="#10b981">(+17.5% abs)</tspan>
+      </text>
+    </g>
+  </g>
+</svg>

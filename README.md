@@ -6,6 +6,10 @@ Deterministic, prefix-aware reverse proxy and radix router for distributed LLM i
 [![Rust](https://img.shields.io/badge/rust-1.80%2B-informational.svg)](https://www.rust-lang.org)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
+<p align="center">
+  <img src="assets/radix_dashboard_demo.svg" alt="RadixGate Terminal Dashboard (radix-gate top)" width="100%">
+</p>
+
 ---
 
 ## Overview
@@ -55,18 +59,38 @@ Where:
 
 ## Benchmark Results
 
+<p align="center">
+  <img src="assets/benchmark_comparison.svg" alt="RadixGate Benchmark Comparison" width="100%">
+</p>
+
+### 1. Comparative Discrete Simulation (Constrained KV Cache)
 Evaluation was conducted using a synthetic trace of 20 concurrent agent sessions (shared system definitions and tool schemas, interleaved multi-turn queries) across 4 simulated inference workers under constrained KV cache capacity (150 blocks per worker):
 
 | Routing Policy | Total Requests | Cache Hit Rate | Mean TTFT | P95 TTFT | P99 TTFT | Total Prefill Compute | Speedup vs RR |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| Round-Robin (Prefix-Blind) | 1,000 | 68.7% | 11.65 ms | 32.40 ms | 46.80 ms | 11.65 s | 1.00x |
-| Least-Loaded (Prefix-Blind) | 1,000 | 68.9% | 11.58 ms | 32.40 ms | 46.80 ms | 11.58 s | 1.01x |
-| **RadixGate (Prefix-Aware)** | **1,000** | **86.6%** | **5.64 ms** | **20.28 ms** | **38.40 ms** | **5.64 s** | **2.06x** |
+| Round-Robin (Prefix-Blind) | 1,000 | 69.3% | 11.62 ms | 33.60 ms | 46.80 ms | 11.62 s | 1.00x |
+| Least-Loaded (Prefix-Blind) | 1,000 | 69.4% | 11.57 ms | 32.40 ms | 45.60 ms | 11.57 s | 1.00x |
+| **RadixGate (Prefix-Aware)** | **1,000** | **86.8%** | **5.67 ms** | **20.24 ms** | **34.80 ms** | **5.67 s** | **2.05x** |
 
 Observed performance characteristics:
-- 51.6% reduction in aggregate GPU prefill compute cycles.
-- 2.06x mean TTFT speedup under identical concurrency constraints.
+- **51.6% reduction in aggregate GPU prefill compute cycles**.
+- **2.05x mean TTFT speedup** under identical concurrency constraints.
 - Effective suppression of cache thrashing without hot-spotting individual replicas.
+
+### 2. High-Concurrency Socket Load Test (Live TCP Gateway)
+Benchmarked using the built-in Tokio async socket load engine (`radix-gate load-test`) against a live proxy running 4 inference worker replicas:
+
+| Metric | Measured Value |
+| :--- | :--- |
+| **Target Concurrency** | 25 concurrent async Tokio socket workers |
+| **Total Completed Requests** | 500 requests (4 shared system prefixes, 4 turns/session) |
+| **Success Rate (HTTP 2xx)** | **100.0%** (500 / 500) |
+| **Proxy Routing Throughput** | **23,935.8 requests / sec** |
+| **Global KV-Cache Hit Ratio** | **98.57%** (893 / 906 token blocks warm) |
+| **Median Latency (P50)** | **0.64 ms** |
+| **95th Percentile Latency (P95)** | **2.05 ms** |
+| **99th Percentile Latency (P99)** | **7.03 ms** |
+| **P2C-Prefix Traffic Distribution** | Balanced dynamically: `w-01`: 50.4%, `w-02`: 24.8%, `w-03`: 24.8% |
 
 ---
 

@@ -1,0 +1,196 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 540" width="100%" height="100%">
+  <defs>
+    <linearGradient id="bgGradient" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0a0d14"/>
+      <stop offset="100%" stop-color="#101522"/>
+    </linearGradient>
+    <linearGradient id="barGreen" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#10b981"/>
+      <stop offset="100%" stop-color="#34d399"/>
+    </linearGradient>
+    <linearGradient id="barCyan" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#06b6d4"/>
+      <stop offset="100%" stop-color="#38bdf8"/>
+    </linearGradient>
+    <linearGradient id="barPurple" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#8b5cf6"/>
+      <stop offset="100%" stop-color="#a78bfa"/>
+    </linearGradient>
+    <filter id="glow" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur stdDeviation="3" result="blur" />
+      <feComposite in="SourceGraphic" in2="blur" operator="over"/>
+    </filter>
+  </defs>
+
+  <style>
+    .font-mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
+    .font-sans { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+    .text-title { font-size: 13px; font-weight: 600; fill: #94a3b8; }
+    .text-val { font-size: 22px; font-weight: 700; fill: #f8fafc; }
+    .text-label { font-size: 11px; fill: #64748b; font-weight: 500; }
+    .code-tree { font-size: 12px; fill: #e2e8f0; line-height: 1.5; }
+    .kw-hit { fill: #34d399; font-weight: 600; }
+    .kw-worker { fill: #38bdf8; font-weight: 600; }
+    .kw-hash { fill: #a78bfa; }
+    .kw-meta { fill: #94a3b8; }
+  </style>
+
+  <!-- Window Container -->
+  <rect width="960" height="540" rx="12" fill="url(#bgGradient)" stroke="#1e293b" stroke-width="1.5"/>
+
+  <!-- Window Titlebar -->
+  <rect width="960" height="38" rx="12" fill="#0f172a"/>
+  <rect y="26" width="960" height="12" fill="#0f172a"/>
+  <line x1="0" y1="38" x2="960" y2="38" stroke="#1e293b" stroke-width="1"/>
+
+  <!-- Window Buttons -->
+  <circle cx="22" cy="19" r="6" fill="#ef4444"/>
+  <circle cx="42" cy="19" r="6" fill="#f59e0b"/>
+  <circle cx="62" cy="19" r="6" fill="#10b981"/>
+
+  <!-- Title Text -->
+  <text x="480" y="24" text-anchor="middle" class="font-mono text-title" fill="#94a3b8">
+    radix-gate top — 127.0.0.1:8080 <tspan fill="#34d399">● CONNECTED</tspan> [P2C-Prefix Policy]
+  </text>
+
+  <!-- Top Metric Cards Row (y: 50, h: 84) -->
+  <!-- Card 1: KV Hit Ratio -->
+  <g transform="translate(18, 50)">
+    <rect width="216" height="84" rx="8" fill="#0b1120" stroke="#1e293b" stroke-width="1"/>
+    <text x="14" y="24" class="font-sans text-label">GLOBAL KV-CACHE HIT RATIO</text>
+    <text x="14" y="52" class="font-mono text-val" fill="#34d399" filter="url(#glow)">86.8%</text>
+    <text x="96" y="52" class="font-mono text-label" fill="#10b981">+2.05x vs RR</text>
+    <!-- Bar -->
+    <rect x="14" y="64" width="188" height="6" rx="3" fill="#1e293b"/>
+    <rect x="14" y="64" width="163" height="6" rx="3" fill="url(#barGreen)"/>
+  </g>
+
+  <!-- Card 2: Cluster Throughput -->
+  <g transform="translate(252, 50)">
+    <rect width="216" height="84" rx="8" fill="#0b1120" stroke="#1e293b" stroke-width="1"/>
+    <text x="14" y="24" class="font-sans text-label">CLUSTER ROUTING THROUGHPUT</text>
+    <text x="14" y="52" class="font-mono text-val" fill="#38bdf8" filter="url(#glow)">23,935</text>
+    <text x="110" y="52" class="font-mono text-label" fill="#0284c7">req / sec</text>
+    <!-- Bar -->
+    <rect x="14" y="64" width="188" height="6" rx="3" fill="#1e293b"/>
+    <rect x="14" y="64" width="170" height="6" rx="3" fill="url(#barCyan)"/>
+  </g>
+
+  <!-- Card 3: Token Block Match -->
+  <g transform="translate(486, 50)">
+    <rect width="216" height="84" rx="8" fill="#0b1120" stroke="#1e293b" stroke-width="1"/>
+    <text x="14" y="24" class="font-sans text-label">TOKEN BLOCKS REUSED</text>
+    <text x="14" y="52" class="font-mono text-val" fill="#a78bfa">15,420</text>
+    <text x="100" y="52" class="font-mono text-label" fill="#94a3b8">/ 17,800 blk</text>
+    <!-- Bar -->
+    <rect x="14" y="64" width="188" height="6" rx="3" fill="#1e293b"/>
+    <rect x="14" y="64" width="163" height="6" rx="3" fill="url(#barPurple)"/>
+  </g>
+
+  <!-- Card 4: TTFT Latency -->
+  <g transform="translate(720, 50)">
+    <rect width="222" height="84" rx="8" fill="#0b1120" stroke="#1e293b" stroke-width="1"/>
+    <text x="14" y="24" class="font-sans text-label">TIME TO FIRST TOKEN (TTFT)</text>
+    <text x="14" y="52" class="font-mono text-val" fill="#facc15">5.67 ms</text>
+    <text x="112" y="52" class="font-mono text-label" fill="#ca8a04">P99: 34.8ms</text>
+    <!-- Bar -->
+    <rect x="14" y="64" width="194" height="6" rx="3" fill="#1e293b"/>
+    <rect x="14" y="64" width="102" height="6" rx="3" fill="#facc15"/>
+  </g>
+
+  <!-- Main Body Content (y: 146) -->
+  <!-- Left Panel: Live Radix Tree Topology (w: 520, h: 350) -->
+  <g transform="translate(18, 146)">
+    <rect width="520" height="350" rx="8" fill="#070a12" stroke="#1e293b" stroke-width="1"/>
+    <rect width="520" height="32" rx="8" fill="#0f172a"/>
+    <rect y="24" width="520" height="8" fill="#0f172a"/>
+    <text x="14" y="21" class="font-mono text-title" fill="#38bdf8">LIVE RADIX TREE TOPOLOGY [Block: 64 tok | Branch Depth: 6]</text>
+    <line x1="0" y1="32" x2="520" y2="32" stroke="#1e293b" stroke-width="1"/>
+
+    <!-- Tree Content -->
+    <g transform="translate(16, 56)" class="font-mono code-tree">
+      <text y="0"><tspan fill="#64748b">ROOT</tspan> <tspan class="kw-meta">[BPE cl100k_base | 64-tok boundary]</tspan></text>
+      
+      <text y="24"><tspan fill="#475569">├── </tspan><tspan class="kw-hash">[0x8f2a1b9c..0x3e110a72]</tspan> <tspan class="kw-meta">(4 blk)</tspan></text>
+      <text y="44"><tspan fill="#475569">│   ├── </tspan><tspan fill="#94a3b8">Cached: </tspan><tspan class="kw-worker">worker-01</tspan>, <tspan class="kw-worker">worker-03</tspan> <tspan class="kw-hit">(Hits: 412)</tspan></text>
+      <text y="64"><tspan fill="#475569">│   ├── </tspan><tspan class="kw-hash">[0x09a4128f]</tspan> <tspan class="kw-meta">[Cached: </tspan><tspan class="kw-worker">worker-01</tspan><tspan class="kw-meta">]</tspan> <tspan fill="#f59e0b">[InFlight: 1]</tspan> <tspan class="kw-hit">(Hits: 92)</tspan></text>
+      <text y="84"><tspan fill="#475569">│   └── </tspan><tspan class="kw-hash">[0x7b5e4120..0x91d302a4]</tspan> <tspan class="kw-meta">(2 blk)</tspan> <tspan class="kw-meta">[Cached: </tspan><tspan class="kw-worker">worker-03</tspan><tspan class="kw-meta">]</tspan> <tspan class="kw-hit">(Hits: 38)</tspan></text>
+      
+      <text y="112"><tspan fill="#475569">├── </tspan><tspan class="kw-hash">[0x6098e6b8..0x7e99b7c7]</tspan> <tspan class="kw-meta">(Viral System Prompt - </tspan><tspan fill="#ec4899">HOTSPOT</tspan><tspan class="kw-meta">)</tspan></text>
+      <text y="132"><tspan fill="#475569">│   ├── </tspan><tspan fill="#94a3b8">Replicated: </tspan><tspan class="kw-worker">worker-01</tspan> <tspan fill="#64748b">➔</tspan> <tspan class="kw-worker">worker-02</tspan> <tspan class="kw-hit">(Hits: 884)</tspan></text>
+      <text y="152"><tspan fill="#475569">│   └── </tspan><tspan class="kw-hash">[0x2dafb93d]</tspan> <tspan class="kw-meta">[InFlight Lease Active - 90% Warm Weight]</tspan></text>
+
+      <text y="180"><tspan fill="#475569">└── </tspan><tspan class="kw-hash">[0xfa58bbe2..0x4d98d6d2]</tspan> <tspan class="kw-meta">(3 blk)</tspan></text>
+      <text y="200"><tspan fill="#475569">    └── </tspan><tspan class="kw-meta">[Cached: </tspan><tspan class="kw-worker">worker-04</tspan><tspan class="kw-meta">]</tspan> <tspan class="kw-hit">(Hits: 156)</tspan> <tspan fill="#64748b">[Last: 42ms ago]</tspan></text>
+      
+      <text y="234" fill="#3b82f6">● Coalesced 14 thundering-herd concurrent prefills</text>
+      <text y="254" fill="#10b981">● Mesh gossip: 2 peers synchronized via UDP :9090 (&lt;0.8ms)</text>
+    </g>
+  </g>
+
+  <!-- Right Panel: Inference Worker Fleet (w: 396, h: 350) -->
+  <g transform="translate(546, 146)">
+    <rect width="396" height="350" rx="8" fill="#070a12" stroke="#1e293b" stroke-width="1"/>
+    <rect width="396" height="32" rx="8" fill="#0f172a"/>
+    <rect y="24" width="396" height="8" fill="#0f172a"/>
+    <text x="14" y="21" class="font-mono text-title" fill="#a78bfa">GPU WORKER FLEET STATUS</text>
+    <line x1="0" y1="32" x2="396" y2="32" stroke="#1e293b" stroke-width="1"/>
+
+    <!-- Worker 1 -->
+    <g transform="translate(14, 46)">
+      <text x="0" y="14" class="font-mono" font-size="12" fill="#34d399">● OK</text>
+      <text x="36" y="14" class="font-mono" font-size="12" fill="#f8fafc" font-weight="600">worker-01 (Prefill)</text>
+      <text x="210" y="14" class="font-mono" font-size="11" fill="#94a3b8">InFlight: 2/32</text>
+      <text x="310" y="14" class="font-mono" font-size="11" fill="#38bdf8">KV: 68.4%</text>
+      <rect x="0" y="24" width="368" height="6" rx="3" fill="#1e293b"/>
+      <rect x="0" y="24" width="251" height="6" rx="3" fill="url(#barCyan)"/>
+    </g>
+
+    <!-- Worker 2 -->
+    <g transform="translate(14, 98)">
+      <text x="0" y="14" class="font-mono" font-size="12" fill="#34d399">● OK</text>
+      <text x="36" y="14" class="font-mono" font-size="12" fill="#f8fafc" font-weight="600">worker-02 (Decode)</text>
+      <text x="210" y="14" class="font-mono" font-size="11" fill="#94a3b8">InFlight: 1/64</text>
+      <text x="310" y="14" class="font-mono" font-size="11" fill="#34d399">KV: 54.2%</text>
+      <rect x="0" y="24" width="368" height="6" rx="3" fill="#1e293b"/>
+      <rect x="0" y="24" width="199" height="6" rx="3" fill="url(#barGreen)"/>
+    </g>
+
+    <!-- Worker 3 -->
+    <g transform="translate(14, 150)">
+      <text x="0" y="14" class="font-mono" font-size="12" fill="#34d399">● OK</text>
+      <text x="36" y="14" class="font-mono" font-size="12" fill="#f8fafc" font-weight="600">worker-03 (Unified)</text>
+      <text x="210" y="14" class="font-mono" font-size="11" fill="#94a3b8">InFlight: 3/48</text>
+      <text x="310" y="14" class="font-mono" font-size="11" fill="#f59e0b">KV: 82.1%</text>
+      <rect x="0" y="24" width="368" height="6" rx="3" fill="#1e293b"/>
+      <rect x="0" y="24" width="302" height="6" rx="3" fill="#f59e0b"/>
+    </g>
+
+    <!-- Worker 4 -->
+    <g transform="translate(14, 202)">
+      <text x="0" y="14" class="font-mono" font-size="12" fill="#34d399">● OK</text>
+      <text x="36" y="14" class="font-mono" font-size="12" fill="#f8fafc" font-weight="600">worker-04 (Decode)</text>
+      <text x="210" y="14" class="font-mono" font-size="11" fill="#94a3b8">InFlight: 0/64</text>
+      <text x="310" y="14" class="font-mono" font-size="11" fill="#10b981">KV: 41.0%</text>
+      <rect x="0" y="24" width="368" height="6" rx="3" fill="#1e293b"/>
+      <rect x="0" y="24" width="151" height="6" rx="3" fill="url(#barGreen)"/>
+    </g>
+
+    <!-- Disaggregated P/D Notice -->
+    <g transform="translate(14, 256)">
+      <rect width="368" height="42" rx="6" fill="#1e293b" fill-opacity="0.4" stroke="#334155" stroke-width="1"/>
+      <text x="12" y="18" class="font-mono" font-size="11" fill="#cbd5e1">Scheduler: <tspan fill="#38bdf8">Disaggregated Prefill/Decode</tspan></text>
+      <text x="12" y="32" class="font-mono" font-size="10" fill="#94a3b8">Cold &lt;35% hits ➔ Prefill | Warm &gt;70% hits ➔ Decode</text>
+    </g>
+  </g>
+
+  <!-- Bottom Terminal Status Bar (y: 506) -->
+  <line x1="0" y1="506" x2="960" y2="506" stroke="#1e293b" stroke-width="1"/>
+  <rect y="506" width="960" height="34" rx="12" fill="#090d16"/>
+  <text x="20" y="527" class="font-mono" font-size="11" fill="#64748b">
+    [q] Quit  |  [r] Force Telemetry Poll  |  [w] Worker Detail  |  W3C Trace: <tspan fill="#94a3b8">Active</tspan>  |  RadixGate v0.1.0
+  </text>
+  <text x="940" y="527" text-anchor="end" class="font-mono" font-size="11" fill="#38bdf8">
+    23,935 req/s · 0.94ms avg · 98.6% hit
+  </text>
+</svg>
