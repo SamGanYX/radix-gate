@@ -532,7 +532,7 @@ mod tests {
             16,
         ));
         let chunker = BlockChunker::new(64);
-        let state = Arc::new(AppState::new(radix_tree, worker_pool, chunker));
+        let state = Arc::new(AppState::new(radix_tree, worker_pool, chunker).with_mock_mode(true));
         let router = create_router(state);
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

@@ -105,7 +105,9 @@ async fn test_e2e_dual_gateway_mesh_and_disaggregation() {
     let _mesh_listener_2 = mesh_2.clone().start_listener();
 
     let state_2 = Arc::new(
-        AppState::new(tree_2.clone(), worker_pool_2, BlockChunker::new(64)).with_mesh(mesh_2),
+        AppState::new(tree_2.clone(), worker_pool_2, BlockChunker::new(64))
+            .with_mesh(mesh_2)
+            .with_mock_mode(true),
     );
     let http_listener_2 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let http_port_2 = http_listener_2.local_addr().unwrap().port();
@@ -130,7 +132,9 @@ async fn test_e2e_dual_gateway_mesh_and_disaggregation() {
     let _mesh_listener_1 = mesh_1.clone().start_listener();
 
     let state_1 = Arc::new(
-        AppState::new(tree_1.clone(), worker_pool_1, BlockChunker::new(64)).with_mesh(mesh_1),
+        AppState::new(tree_1.clone(), worker_pool_1, BlockChunker::new(64))
+            .with_mesh(mesh_1)
+            .with_mock_mode(true),
     );
     let http_listener_1 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let http_port_1 = http_listener_1.local_addr().unwrap().port();
@@ -218,7 +222,7 @@ async fn test_e2e_load_test_and_openmetrics_verification() {
         16,
     ));
 
-    let state = Arc::new(AppState::new(tree, pool, BlockChunker::new(64)));
+    let state = Arc::new(AppState::new(tree, pool, BlockChunker::new(64)).with_mock_mode(true));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     tokio::spawn(async move {

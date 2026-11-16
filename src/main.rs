@@ -157,6 +157,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let worker_pool = Arc::new(WorkerPool::new());
             let chunker = BlockChunker::new(final_block_size);
 
+            let mut is_mock_mode = false;
             if let Some(ref cfg) = loaded_cfg {
                 if !cfg.workers.is_empty() {
                     for w in &cfg.workers {
@@ -173,7 +174,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             role,
                         ));
                     }
-                } else {
+                } else if !cfg.discovery.enabled {
+                    is_mock_mode = true;
                     for i in 0..mock_workers {
                         let id = format!("worker-{:02}", i + 1);
                         let url = format!("http://127.0.0.1:800{}", i + 1);
@@ -191,6 +193,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     worker_pool.add_worker(WorkerReplica::new(id, url.to_string(), 20_000, 64));
                 }
             } else {
+                is_mock_mode = true;
                 for i in 0..mock_workers {
                     let id = format!("worker-{:02}", i + 1);
                     let url = format!("http://127.0.0.1:800{}", i + 1);
@@ -242,7 +245,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 None
             };
 
-            let mut app_state_raw = AppState::new(radix_tree.clone(), worker_pool.clone(), chunker);
+            let mut app_state_raw = AppState::new(radix_tree.clone(), worker_pool.clone(), chunker)
+                .with_mock_mode(is_mock_mode);
             if let Some(m) = mesh_opt {
                 app_state_raw = app_state_raw.with_mesh(m);
             }

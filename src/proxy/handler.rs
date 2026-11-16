@@ -32,6 +32,7 @@ pub struct AppState {
     pub mesh: Option<Arc<crate::mesh::GatewayMesh>>,
     pub config_path: Option<PathBuf>,
     pub current_config: Arc<RwLock<GatewayConfig>>,
+    pub mock_mode: bool,
 
     // Performance metrics
     pub total_requests: AtomicU64,
@@ -58,6 +59,7 @@ impl AppState {
             mesh: None,
             config_path: None,
             current_config: Arc::new(RwLock::new(GatewayConfig::default())),
+            mock_mode: false,
             total_requests: AtomicU64::new(0),
             total_matched_blocks: AtomicU64::new(0),
             total_prompt_blocks: AtomicU64::new(0),
@@ -77,6 +79,11 @@ impl AppState {
 
     pub fn with_mesh(mut self, mesh: Arc<crate::mesh::GatewayMesh>) -> Self {
         self.mesh = Some(mesh);
+        self
+    }
+
+    pub fn with_mock_mode(mut self, mock: bool) -> Self {
+        self.mock_mode = mock;
         self
     }
 
@@ -490,11 +497,10 @@ async fn handle_routing(
     let endpoint_url = decision.endpoint_url.clone();
     let is_real_upstream =
         endpoint_url.starts_with("http://") || endpoint_url.starts_with("https://");
-    let is_mock_port = endpoint_url.contains(":800"); // default mock ports 8001-8004
 
     let mut final_response: Option<Response> = None;
 
-    if is_real_upstream && !is_mock_port {
+    if is_real_upstream && !state.mock_mode {
         // Attempt primary worker
         match try_forward_upstream(
             &state.client,
@@ -999,11 +1005,14 @@ mod tests {
             1000,
             16,
         ));
-        let state = Arc::new(AppState::new(
-            Arc::new(RwLock::new(RadixTree::new(64))),
-            pool.clone(),
-            BlockChunker::new(64),
-        ));
+        let state = Arc::new(
+            AppState::new(
+                Arc::new(RwLock::new(RadixTree::new(64))),
+                pool.clone(),
+                BlockChunker::new(64),
+            )
+            .with_mock_mode(true),
+        );
         let router = create_router(state);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
