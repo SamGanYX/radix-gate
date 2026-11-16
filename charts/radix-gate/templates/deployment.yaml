@@ -34,6 +34,7 @@ spec:
           command:
             - "/usr/local/bin/radix-gate"
           args:
+            - "serve"
             - "--config"
             - "/etc/radixgate/radixgate.yaml"
           ports:

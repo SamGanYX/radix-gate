@@ -18,14 +18,18 @@ def _extract_routing_metadata(headers: httpx.Headers) -> PrefixRoutingMetadata:
     """Extracts custom X-Radix-* headers into a structured PrefixRoutingMetadata instance."""
     worker = headers.get("x-radix-worker")
     matched = int(headers.get("x-radix-matched-blocks", "0"))
-    prompt = int(headers.get("x-radix-prompt-blocks", "0"))
+    total = int(
+        headers.get("x-radix-total-blocks", headers.get("x-radix-prompt-blocks", "0"))
+    )
     hit_ratio = float(headers.get("x-radix-hit-ratio", "0.0"))
+    trace_id = headers.get("x-radix-trace-id")
 
     return PrefixRoutingMetadata(
         worker_id=worker,
         matched_blocks=matched,
-        prompt_blocks=prompt,
+        total_blocks=total,
         cache_hit_ratio=hit_ratio,
+        trace_id=trace_id,
     )
 
 

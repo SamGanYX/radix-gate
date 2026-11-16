@@ -67,5 +67,4 @@ discovery:
 tracing:
   enabled: true
   service_name: "radix-gate"
-  endpoint: "http://localhost:4317"
   sample_rate: 1.0

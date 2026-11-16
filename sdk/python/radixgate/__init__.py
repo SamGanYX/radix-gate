@@ -8,6 +8,9 @@ from .models import (
     EvictionSyncResponse,
     ClusterHealthResponse,
     ClusterMetrics,
+    PerformanceMetrics,
+    RadixTreeStats,
+    WorkerMetricSummary,
 )
 from .client import (
     RadixGateClient,

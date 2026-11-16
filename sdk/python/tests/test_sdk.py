@@ -13,6 +13,9 @@ from radixgate.models import (
     EvictionSyncResponse,
     ClusterHealthResponse,
     ClusterMetrics,
+    PerformanceMetrics,
+    RadixTreeStats,
+    WorkerMetricSummary,
 )
 from radixgate.client import (
     RadixGateClient,
@@ -29,12 +32,14 @@ class TestRadixGateModels(unittest.TestCase):
         meta = PrefixRoutingMetadata(
             worker_id="worker-01",
             matched_blocks=4,
-            prompt_blocks=10,
+            total_blocks=10,
             cache_hit_ratio=0.40,
+            trace_id="4bf92f3577b34da6a3ce929d0e0e4736",
         )
         self.assertTrue(meta.is_cache_hit)
         self.assertEqual(meta.worker_id, "worker-01")
         self.assertEqual(meta.matched_blocks, 4)
+        self.assertEqual(meta.total_blocks, 10)
         self.assertAlmostEqual(meta.cache_hit_ratio, 0.40)
 
         cold_meta = PrefixRoutingMetadata(matched_blocks=0)
@@ -51,14 +56,25 @@ class TestRadixGateModels(unittest.TestCase):
 
     def test_cluster_metrics(self):
         metrics = ClusterMetrics(
-            requests_total=100,
-            cache_hit_ratio=0.85,
-            matched_blocks_total=850,
-            prompt_blocks_total=1000,
-            worker_loads={"w1": 2, "w2": 1},
+            status="healthy",
+            radix_tree=RadixTreeStats(total_nodes=12, unique_workers=2),
+            performance=PerformanceMetrics(
+                total_requests=100,
+                total_matched_blocks=850,
+                total_prompt_blocks=1000,
+                cluster_cache_hit_ratio="85.00%",
+            ),
+            workers=[
+                WorkerMetricSummary(
+                    id="w1",
+                    endpoint="http://127.0.0.1:8001",
+                    load=2,
+                )
+            ],
         )
-        self.assertEqual(metrics.requests_total, 100)
-        self.assertEqual(metrics.worker_loads["w1"], 2)
+        self.assertEqual(metrics.performance.total_requests, 100)
+        self.assertAlmostEqual(metrics.performance.hit_ratio_float, 0.85)
+        self.assertEqual(metrics.workers[0].load, 2)
 
 
 class TestRadixGateClient(unittest.TestCase):
@@ -66,53 +82,70 @@ class TestRadixGateClient(unittest.TestCase):
         headers = httpx.Headers({
             "x-radix-worker": "worker-42",
             "x-radix-matched-blocks": "8",
-            "x-radix-prompt-blocks": "16",
-            "x-radix-hit-ratio": "0.5000",
+            "x-radix-total-blocks": "16",
+            "x-radix-hit-ratio": "0.50",
+            "x-radix-trace-id": "4bf92f3577b34da6a3ce929d0e0e4736",
         })
         meta = _extract_routing_metadata(headers)
         self.assertEqual(meta.worker_id, "worker-42")
         self.assertEqual(meta.matched_blocks, 8)
-        self.assertEqual(meta.prompt_blocks, 16)
+        self.assertEqual(meta.total_blocks, 16)
         self.assertAlmostEqual(meta.cache_hit_ratio, 0.50)
+        self.assertEqual(meta.trace_id, "4bf92f3577b34da6a3ce929d0e0e4736")
 
     def test_sync_client_endpoints(self):
         mock_client = MagicMock(spec=httpx.Client)
 
-        # Mock /health
+        # Mock /health (exact Rust server JSON)
         mock_resp_health = MagicMock()
         mock_resp_health.json.return_value = {
-            "status": "healthy",
-            "healthy_workers": 4,
-            "total_workers": 4,
+            "status": "ok",
+            "service": "radix-gate",
         }
         mock_client.get.return_value = mock_resp_health
 
         client = RadixGateClient(client=mock_client)
         health = client.health()
-        self.assertEqual(health.status, "healthy")
-        self.assertEqual(health.healthy_workers, 4)
+        self.assertEqual(health.status, "ok")
+        self.assertEqual(health.service, "radix-gate")
 
-        # Mock /metrics
+        # Mock /metrics (exact Rust server JSON)
         mock_resp_metrics = MagicMock()
         mock_resp_metrics.json.return_value = {
-            "requests_total": 50,
-            "cache_hit_ratio": 0.80,
-            "matched_blocks_total": 400,
-            "prompt_blocks_total": 500,
-            "worker_loads": {"w1": 1},
+            "status": "healthy",
+            "radix_tree": {"total_nodes": 5, "unique_workers": 1},
+            "performance": {
+                "total_requests": 50,
+                "total_matched_blocks": 400,
+                "total_prompt_blocks": 500,
+                "cluster_cache_hit_ratio": "80.00%",
+            },
+            "workers": [
+                {
+                    "id": "w1",
+                    "endpoint": "http://127.0.0.1:8001",
+                    "load": 1,
+                    "role": "Unified",
+                    "role_badge": "[U]",
+                    "cache_utilization": "12.5%",
+                    "total_routed": 50,
+                    "matched_blocks": 400,
+                    "prefilled_blocks": 100,
+                }
+            ],
         }
         mock_client.get.return_value = mock_resp_metrics
         metrics = client.metrics()
-        self.assertEqual(metrics.requests_total, 50)
-        self.assertAlmostEqual(metrics.cache_hit_ratio, 0.80)
+        self.assertEqual(metrics.performance.total_requests, 50)
+        self.assertAlmostEqual(metrics.performance.hit_ratio_float, 0.80)
 
         # Mock /v1/chat/completions
         mock_resp_chat = MagicMock()
         mock_resp_chat.headers = httpx.Headers({
             "x-radix-worker": "worker-01",
             "x-radix-matched-blocks": "12",
-            "x-radix-prompt-blocks": "12",
-            "x-radix-hit-ratio": "1.0000",
+            "x-radix-total-blocks": "12",
+            "x-radix-hit-ratio": "1.00",
         })
         mock_resp_chat.json.return_value = {"choices": [{"message": {"content": "ok"}}]}
         mock_client.post.return_value = mock_resp_chat

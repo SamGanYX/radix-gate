@@ -331,7 +331,7 @@ resp, meta = client.chat_completion({
 })
 
 print(f"Routed Worker: {meta.worker_id}")
-print(f"Warm Prefix Blocks: {meta.matched_blocks}/{meta.prompt_blocks}")
+print(f"Warm Prefix Blocks: {meta.matched_blocks}/{meta.total_blocks}")
 print(f"Instantaneous Hit Ratio: {meta.cache_hit_ratio * 100:.1f}%")
 ```
 
@@ -389,7 +389,7 @@ RadixGate supports enterprise YAML configuration (`config/radixgate.example.yaml
 
 ```bash
 # Start gateway with declarative YAML configuration
-cargo run --release -- --config config/radixgate.example.yaml
+cargo run --release -- serve --config config/radixgate.example.yaml
 ```
 
 Update balancing parameters, timeouts, or worker weights at runtime with **zero downtime**:

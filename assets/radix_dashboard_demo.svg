@@ -38,21 +38,21 @@
   <rect x="14" y="92" width="216" height="68" rx="5" class="subbox-border"/>
   <text x="24" y="109" class="mono txt-dim">╭─ Global KV Hit Ratio ──╮</text>
   <text x="28" y="132" class="mono" font-size="12">
-    <tspan fill="#3fb950">[████████████████░░░░] </tspan><tspan class="txt-green">86.8%</tspan>
+    <tspan fill="#3fb950">[███████████████████░] </tspan><tspan class="txt-green">98.6%</tspan>
   </text>
-  <text x="28" y="148" class="mono txt-dim">Speedup: +2.05x vs RoundRobin</text>
+  <text x="28" y="148" class="mono txt-dim">Live Socket Load Test (4 workers)</text>
 
   <!-- KPI 2: Throughput -->
   <rect x="238" y="92" width="216" height="68" rx="5" class="subbox-border"/>
   <text x="248" y="109" class="mono txt-dim">╭─ Throughput ───────────╮</text>
   <text x="252" y="133" class="mono" font-size="15"><tspan class="txt-green">23,935.8</tspan> <tspan class="txt-primary" font-size="12">req/s</tspan></text>
-  <text x="252" y="148" class="mono txt-dim">100.0% HTTP 2xx (0 errors)</text>
+  <text x="252" y="148" class="mono txt-dim">500 / 500 HTTP 2xx (0 errors)</text>
 
   <!-- KPI 3: Block Reused -->
   <rect x="462" y="92" width="216" height="68" rx="5" class="subbox-border"/>
-  <text x="472" y="109" class="mono txt-dim">╭─ Token Block Reuse ────╮</text>
-  <text x="476" y="133" class="mono" font-size="14"><tspan class="txt-white">15,420</tspan> <tspan class="txt-dim">/ 17,800 blk</tspan></text>
-  <text x="476" y="148" class="mono txt-dim">86.6% GPU Prefill Avoided</text>
+  <text x="472" y="109" class="mono txt-dim">╭─ Block Cache Match ────╮</text>
+  <text x="476" y="133" class="mono" font-size="14"><tspan class="txt-white">893</tspan> <tspan class="txt-dim">/ 906 blk</tspan></text>
+  <text x="476" y="148" class="mono txt-dim">98.57% Prefix Blocks Reused</text>
 
   <!-- KPI 4: Topology Branches -->
   <rect x="686" y="92" width="220" height="68" rx="5" class="subbox-border"/>
@@ -144,7 +144,7 @@
   <!-- Bottom Command Bar (y: 476, h: 26) -->
   <rect x="14" y="476" width="892" height="24" rx="4" fill="#161b22" stroke="#30363d" stroke-width="1"/>
   <text x="24" y="492" class="mono txt-dim">
-    [<tspan class="txt-white">q</tspan>] Quit  |  [<tspan class="txt-white">r</tspan>] Force Poll  |  [<tspan class="txt-white">p</tspan>] Toggle P2C Policy  |  RadixGate v0.1.0
+    [<tspan class="txt-white">q</tspan>] Quit  |  [<tspan class="txt-white">r</tspan>] Force Refresh  |  RadixGate v0.1.0
   </text>
   <text x="896" y="492" text-anchor="end" class="mono txt-dim">
     P50: <tspan class="txt-green">0.64ms</tspan> · P95: <tspan class="txt-green">2.05ms</tspan> · P99: <tspan class="txt-yellow">7.03ms</tspan>

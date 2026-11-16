@@ -224,8 +224,6 @@ pub struct TracingConfigYaml {
     pub enabled: bool,
     #[serde(default = "default_service_name")]
     pub service_name: String,
-    #[serde(default)]
-    pub endpoint: Option<String>,
     #[serde(default = "default_sample_rate")]
     pub sample_rate: f64,
 }
@@ -235,7 +233,6 @@ impl Default for TracingConfigYaml {
         Self {
             enabled: default_tracing_enabled(),
             service_name: default_service_name(),
-            endpoint: None,
             sample_rate: default_sample_rate(),
         }
     }
@@ -333,5 +330,14 @@ tracing:
             role: "unified".into(),
         });
         assert!(cfg3.validate().is_err());
+    }
+
+    #[test]
+    fn test_example_yaml_file_loads_cleanly() {
+        let cfg = GatewayConfig::load_from_file("config/radixgate.example.yaml")
+            .expect("config/radixgate.example.yaml must parse and validate cleanly");
+        assert_eq!(cfg.server.port, 8080);
+        assert_eq!(cfg.workers.len(), 3);
+        assert!(cfg.tracing.enabled);
     }
 }

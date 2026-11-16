@@ -60,29 +60,24 @@ nodeSelector: {}
 tolerations: []
 affinity: {}
 
-# RadixGate Declarative Engine Configuration
+# RadixGate Declarative Engine Configuration (matches GatewayConfig schema)
 radixConfig:
-  gateway:
+  server:
     host: "0.0.0.0"
     port: 8080
-    log_level: "info"
-    mock_upstream: false
-
-  chunking:
-    chunk_size: 64
-    tokenizer_model: "gpt-4"
+    block_size: 64
 
   balancer:
     policy: "prefix_aware" # Options: prefix_aware, p2c_prefix
-    alpha: 0.7
-    beta: 0.3
+    alpha: 0.75
+    beta: 0.25
     saturation_threshold: 0.85
 
   mesh:
     enabled: false
     node_id: "radix-node-1"
-    listen_port: 9000
-    seed_nodes: []
+    bind_addr: "0.0.0.0:9090"
+    peers: []
 
   # Kubernetes headless service discovery for automatic pod scaling & eviction
   discovery:
@@ -100,7 +95,6 @@ radixConfig:
   tracing:
     enabled: true
     service_name: "radix-gate"
-    endpoint: "http://otel-collector.monitoring.svc.cluster.local:4317"
     sample_rate: 1.0
 
 # Prometheus Operator metrics integration

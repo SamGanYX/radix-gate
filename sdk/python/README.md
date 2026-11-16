@@ -27,10 +27,10 @@ client = RadixGateClient(base_url="http://localhost:8080")
 
 # 1. Cluster Health & Metrics
 health = client.health()
-print(f"Cluster Status: {health.status} ({health.healthy_workers}/{health.total_workers} healthy)")
+print(f"Cluster Status: {health.status} ({health.service})")
 
 metrics = client.metrics()
-print(f"Global KV Hit Ratio: {metrics.cache_hit_ratio * 100:.1f}%")
+print(f"Global KV Hit Ratio: {metrics.performance.cluster_cache_hit_ratio}")
 
 # 2. Dispatch Chat Request & Inspect Prefix Cache Hits
 response, meta = client.chat_completion({
@@ -42,8 +42,9 @@ response, meta = client.chat_completion({
 })
 
 print(f"Routed Worker: {meta.worker_id}")
-print(f"Matched Blocks: {meta.matched_blocks} / {meta.prompt_blocks}")
+print(f"Matched Blocks: {meta.matched_blocks} / {meta.total_blocks}")
 print(f"Instantaneous Hit Ratio: {meta.cache_hit_ratio * 100:.1f}%")
+print(f"Trace ID: {meta.trace_id}")
 ```
 
 ### Async Client (`AsyncRadixGateClient`)
