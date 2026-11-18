@@ -161,6 +161,7 @@ async def run_target_benchmark(
     ttfts: List[float] = []
     totals: List[float] = []
     errors = 0
+    total_expected = num_sessions * turns_per_session
 
     async def run_session(session_id: int, client: httpx.AsyncClient):
         nonlocal errors
@@ -178,10 +179,17 @@ async def run_target_benchmark(
                     )
                     ttfts.append(ttft)
                     totals.append(total)
+                    done = len(ttfts)
+                    if done % 20 == 0 or done == total_expected:
+                        print(
+                            f"  [{label}] {done}/{total_expected} requests "
+                            f"(running mean TTFT: {statistics.mean(ttfts):.1f} ms)",
+                            flush=True,
+                        )
                     history.append({"role": "assistant", "content": reply or "Acknowledged."})
                 except Exception as exc:
                     errors += 1
-                    print(f"[error] {label} session {session_id} turn {turn + 1}: {exc}")
+                    print(f"[error] {label} session {session_id} turn {turn + 1}: {exc}", flush=True)
 
     t_wall_start = time.perf_counter()
     async with httpx.AsyncClient(timeout=120.0) as client:
