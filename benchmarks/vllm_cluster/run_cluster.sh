@@ -31,10 +31,11 @@ for i in $(seq 1 "$NUM_WORKERS"); do
     GPU_ID=$((i - 1))
   fi
   echo "  Starting vLLM worker-$i on port $PORT (CUDA_VISIBLE_DEVICES=$GPU_ID, gpu-memory-utilization=$GPU_MEM_UTIL)..."
-  CUDA_VISIBLE_DEVICES="$GPU_ID" python3 -m vllm.entrypoints.openai.api_server \
+  TORCH_COMPILE_DISABLE=1 CUDA_VISIBLE_DEVICES="$GPU_ID" python3 -m vllm.entrypoints.openai.api_server \
     --model "$MODEL" \
     --port "$PORT" \
     --enable-prefix-caching \
+    --enforce-eager \
     --gpu-memory-utilization "$GPU_MEM_UTIL" \
     --max-model-len "$MAX_MODEL_LEN" \
     --disable-log-requests \
