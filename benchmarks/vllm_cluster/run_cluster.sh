@@ -31,7 +31,7 @@ for i in $(seq 1 "$NUM_WORKERS"); do
     GPU_ID=$((i - 1))
   fi
   echo "  Starting vLLM worker-$i on port $PORT (CUDA_VISIBLE_DEVICES=$GPU_ID, gpu-memory-utilization=$GPU_MEM_UTIL)..."
-  TORCH_COMPILE_DISABLE=1 CUDA_VISIBLE_DEVICES="$GPU_ID" python3 -m vllm.entrypoints.openai.api_server \
+  TORCHDYNAMO_DISABLE=1 CUDA_VISIBLE_DEVICES="$GPU_ID" python3 -m vllm.entrypoints.openai.api_server \
     --model "$MODEL" \
     --port "$PORT" \
     --enable-prefix-caching \
@@ -45,8 +45,16 @@ for i in $(seq 1 "$NUM_WORKERS"); do
 done
 
 echo "[2/4] Waiting for all $NUM_WORKERS vLLM workers to become healthy..."
-for url in "${WORKER_URLS[@]}"; do
+for idx in "${!WORKER_URLS[@]}"; do
+  url="${WORKER_URLS[$idx]}"
+  pid="${PIDS[$idx]}"
+  port=$((8001 + idx))
   until curl -sf "${url}/health" > /dev/null; do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      echo "[ERROR] vLLM worker on port $port exited unexpectedly! Last 30 lines of /tmp/vllm_${port}.log:"
+      tail -n 30 "/tmp/vllm_${port}.log"
+      exit 1
+    fi
     sleep 2
   done
   echo "  Healthy: $url"
