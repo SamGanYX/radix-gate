@@ -92,6 +92,19 @@ Benchmarked using the built-in Tokio async socket load engine (`radix-gate load-
 | **99th Percentile Latency (P99)** | **7.03 ms** |
 | **P2C-Prefix Traffic Distribution** | Balanced dynamically: `w-01`: 50.4%, `w-02`: 24.8%, `w-03`: 24.8% |
 
+### 3. Real vLLM Cluster Results (NGINX Round-Robin vs. RadixGate)
+Evaluated end-to-end against **2 live `vLLM 0.34.0` instances** serving `Qwen/Qwen2.5-1.5B-Instruct` with `--enable-prefix-caching` (`--max-model-len 4096`) on an **NVIDIA RTX PRO 4500 Blackwell (32 GB)** using [`benchmarks/vllm_cluster/benchmark_ttft.py`](benchmarks/vllm_cluster/benchmark_ttft.py) (40 concurrent-capable agent sessions × 4 turns = 160 SSE streaming requests per router, ~3,000-token system prompts, concurrency 16):
+
+| Router | Requests | vLLM GPU Cache Hit Rate | Mean TTFT | P50 TTFT | P95 TTFT | Wall Time | Throughput |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **NGINX (Round-Robin)** | 160 / 160 | 88.7% | 676.7 ms | 58.3 ms | 859.5 ms | 47.79 s | 3.4 req/s |
+| **RadixGate (Prefix-Aware)** | **160 / 160** | **92.2%** | **132.2 ms** | 62.9 ms | 878.7 ms | **5.46 s** | **29.3 req/s** |
+
+Key empirical takeaways from the physical vLLM run:
+- **5.12x Mean TTFT speedup** (`676.7 ms` → `132.2 ms`) and **8.75x wall-clock completion speedup** (`47.79 s` → `5.46 s`).
+- Under the initial cold burst (first 20 requests), NGINX Round-Robin scattered uncached ~3,000-token prefills across both replicas and queued to `4,892.8 ms` mean TTFT, whereas RadixGate coalesced shared prefixes via optimistic in-flight leases (`630.5 ms` mean TTFT on the first 20 requests).
+- Physical GPU prefix cache hit rate scraped directly from `vllm:prefix_cache_hits_total` / `queries_total` increased from **88.7%** to **92.2%**.
+
 ---
 
 ## Features
