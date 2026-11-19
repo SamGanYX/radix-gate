@@ -7,8 +7,9 @@ set -euo pipefail
 
 MODEL="${MODEL:-Qwen/Qwen2.5-1.5B-Instruct}"
 NUM_WORKERS="${NUM_WORKERS:-4}"
-GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.20}" # 0.20 * 4 = 0.80 on a 24GB-32GB GPU; set 0.85 if using 1 GPU per worker
-MAX_MODEL_LEN="${MAX_MODEL_LEN:-8192}"
+GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.23}" # 0.23 * 4 = 0.92 on a 24GB-32GB GPU; set 0.85 if using 1 GPU per worker
+MAX_MODEL_LEN="${MAX_MODEL_LEN:-4096}"
+MAX_NUM_SEQS="${MAX_NUM_SEQS:-16}"
 MULTI_GPU="${MULTI_GPU:-0}"          # Set to 1 if you have >= NUM_WORKERS physical GPUs
 BASE_PORT="${BASE_PORT:-8100}"       # Workers bind BASE_PORT+1 .. BASE_PORT+NUM_WORKERS (avoids :8000/:8001 conflicts)
 RADIX_PORT="${RADIX_PORT:-8085}"
@@ -45,6 +46,7 @@ for i in $(seq 1 "$NUM_WORKERS"); do
     --enforce-eager \
     --gpu-memory-utilization "$GPU_MEM_UTIL" \
     --max-model-len "$MAX_MODEL_LEN" \
+    --max-num-seqs "$MAX_NUM_SEQS" \
     --disable-log-requests \
     > "/tmp/vllm_${PORT}.log" 2>&1 &
   PIDS+=($!)
