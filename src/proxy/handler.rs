@@ -52,7 +52,8 @@ impl AppState {
             chunker,
             policy: Arc::new(RwLock::new(Arc::new(PrefixAwarePolicy::default()))),
             client: reqwest::Client::builder()
-                .pool_max_idle_per_host(32)
+                .pool_max_idle_per_host(128)
+                .pool_idle_timeout(std::time::Duration::from_secs(90))
                 .tcp_nodelay(true)
                 .build()
                 .unwrap(),
@@ -363,24 +364,45 @@ pub async fn handle_reload(State(state): State<Arc<AppState>>) -> Response {
 pub async fn handle_chat_completions(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Json(payload): Json<ChatRequest>,
+    raw_body: bytes::Bytes,
 ) -> Response {
-    handle_routing(state, headers, payload, false).await
+    let payload: ChatRequest = match serde_json::from_slice(&raw_body) {
+        Ok(p) => p,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": format!("Invalid JSON payload: {}", e) })),
+            )
+                .into_response();
+        }
+    };
+    handle_routing(state, headers, payload, raw_body, false).await
 }
 
 /// Anthropic Messages API routing handler (`/v1/messages`).
 pub async fn handle_anthropic_messages(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Json(payload): Json<ChatRequest>,
+    raw_body: bytes::Bytes,
 ) -> Response {
-    handle_routing(state, headers, payload, true).await
+    let payload: ChatRequest = match serde_json::from_slice(&raw_body) {
+        Ok(p) => p,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": format!("Invalid JSON payload: {}", e) })),
+            )
+                .into_response();
+        }
+    };
+    handle_routing(state, headers, payload, raw_body, true).await
 }
 
 async fn handle_routing(
     state: Arc<AppState>,
     headers: HeaderMap,
     payload: ChatRequest,
+    raw_body: bytes::Bytes,
     is_anthropic: bool,
 ) -> Response {
     state.total_requests.fetch_add(1, Ordering::Relaxed);
@@ -506,7 +528,8 @@ async fn handle_routing(
             &state.client,
             &endpoint_url,
             &headers,
-            &payload,
+            raw_body.clone(),
+            payload.stream == Some(true),
             is_anthropic,
             &trace_ctx,
         )
@@ -562,7 +585,8 @@ async fn handle_routing(
                             &state.client,
                             &candidate_url,
                             &headers,
-                            &payload,
+                            raw_body.clone(),
+                            payload.stream == Some(true),
                             is_anthropic,
                             &trace_ctx,
                         )
@@ -721,12 +745,14 @@ async fn handle_routing(
     Response::from_parts(parts, tracked_body)
 }
 
-/// Attempts to proxy the request directly to a live upstream vLLM/Anthropic worker.
+/// Attempts to proxy the request directly to a live upstream vLLM/Anthropic worker
+/// using zero-copy raw body passthrough (preserves all API fields without re-serialization).
 async fn try_forward_upstream(
     client: &reqwest::Client,
     endpoint_base: &str,
     client_headers: &HeaderMap,
-    payload: &ChatRequest,
+    raw_body: bytes::Bytes,
+    is_streaming: bool,
     is_anthropic: bool,
     trace_ctx: &crate::tracing::TraceContext,
 ) -> Result<Response, String> {
@@ -737,7 +763,10 @@ async fn try_forward_upstream(
     };
     let target_url = format!("{}{}", endpoint_base.trim_end_matches('/'), path);
 
-    let mut req_builder = client.post(&target_url).json(payload);
+    let mut req_builder = client
+        .post(&target_url)
+        .header("content-type", "application/json")
+        .body(raw_body);
 
     // Propagate W3C distributed traceparent to upstream engine
     let child_span = trace_ctx.child_span();
@@ -777,7 +806,7 @@ async fn try_forward_upstream(
                 response_builder = response_builder.header("x-evicted-blocks", evicted);
             }
 
-            if content_type.contains("text/event-stream") || payload.stream == Some(true) {
+            if content_type.contains("text/event-stream") || is_streaming {
                 response_builder = response_builder
                     .header("cache-control", "no-cache, no-transform")
                     .header("x-accel-buffering", "no");

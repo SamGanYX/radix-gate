@@ -1,9 +1,15 @@
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use crate::trie::BlockHash;
+use parking_lot::RwLock;
 use tiktoken_rs::{CoreBPE, cl100k_base};
 use xxhash_rust::xxh3::{Xxh3, xxh3_64};
 
+const MAX_BPE_CACHE_ENTRIES: usize = 2048;
+
 /// Utility for chunking text and prompt messages into deterministic 64-bit block hashes.
-/// Supports both exact BPE token-level chunking and fast byte streaming.
+/// Supports both exact BPE token-level chunking (with prefix memoization) and zero-allocation streaming.
 #[derive(Clone)]
 pub struct BlockChunker {
     /// Number of tokens per KV block (e.g., 64 for PagedAttention, 1024 for Anthropic breakpoints).
@@ -12,6 +18,9 @@ pub struct BlockChunker {
     pub max_prefix_tokens: Option<usize>,
     /// Core BPE tokenizer instance (lazy/cached).
     bpe: Option<CoreBPE>,
+    /// Bounded memoization cache mapping `xxh3_64(input_slice)` -> computed block hashes.
+    /// Avoids re-running BPE on repeated system prompts or truncated long prefixes.
+    prefix_cache: Arc<RwLock<HashMap<u64, Vec<BlockHash>>>>,
 }
 
 impl std::fmt::Debug for BlockChunker {
@@ -38,6 +47,7 @@ impl BlockChunker {
             block_size,
             max_prefix_tokens: Some(4096),
             bpe,
+            prefix_cache: Arc::new(RwLock::new(HashMap::with_capacity(256))),
         }
     }
 
@@ -53,6 +63,7 @@ impl BlockChunker {
             block_size,
             max_prefix_tokens: Some(4096),
             bpe: None,
+            prefix_cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -89,15 +100,16 @@ impl BlockChunker {
     }
 
     /// Chunks text using exact BPE tokenization (byte-for-byte identical to model input).
-    /// Employs early prefix cutoff to prevent gateway CPU saturation on massive prompts.
+    /// Employs UTF-8 safe early prefix cutoff and bounded memoization to prevent gateway CPU saturation.
     pub fn chunk_text(&self, text: &str) -> Vec<BlockHash> {
         if let Some(ref bpe) = self.bpe {
             let input_slice = if let Some(max_tokens) = self.max_prefix_tokens {
                 let char_cutoff = max_tokens.saturating_mul(6);
                 if text.len() > char_cutoff {
-                    let safe_idx = text[..char_cutoff]
+                    let boundary = text.floor_char_boundary(char_cutoff);
+                    let safe_idx = text[..boundary]
                         .rfind(|c: char| c.is_whitespace() || c == '\n')
-                        .unwrap_or(char_cutoff);
+                        .unwrap_or(boundary);
                     &text[..safe_idx]
                 } else {
                     text
@@ -106,36 +118,57 @@ impl BlockChunker {
                 text
             };
 
+            let cache_key = xxh3_64(input_slice.as_bytes());
+            if let Some(cached) = self.prefix_cache.read().get(&cache_key) {
+                return cached.clone();
+            }
+
             let mut tokens = bpe.encode_with_special_tokens(input_slice);
             if let Some(max_tokens) = self.max_prefix_tokens {
                 tokens.truncate(max_tokens);
             }
-            self.chunk_tokens(&tokens)
+            let hashes = self.chunk_tokens(&tokens);
+
+            {
+                let mut cache = self.prefix_cache.write();
+                if cache.len() >= MAX_BPE_CACHE_ENTRIES {
+                    cache.clear();
+                }
+                cache.insert(cache_key, hashes.clone());
+            }
+
+            hashes
         } else {
             self.chunk_text_fast(text)
         }
     }
 
-    /// Fast zero-allocation fallback chunker without BPE overhead.
+    /// Fast zero-allocation streaming fallback chunker without BPE overhead.
     pub fn chunk_text_fast(&self, text: &str) -> Vec<BlockHash> {
-        let words: Vec<&str> = text.split_whitespace().collect();
-        if words.is_empty() {
-            return Vec::new();
+        let block_size = self.block_size.max(1);
+        let mut hashes = Vec::new();
+        let mut hasher = Xxh3::new();
+        let mut count = 0usize;
+
+        for word in text.split_whitespace() {
+            if count > 0 {
+                hasher.update(b" ");
+            }
+            hasher.update(word.as_bytes());
+            count += 1;
+
+            if count == block_size {
+                hashes.push(hasher.digest());
+                hasher.reset();
+                count = 0;
+            }
         }
 
-        words
-            .chunks(self.block_size)
-            .map(|chunk| {
-                let mut hasher = Xxh3::new();
-                for (i, word) in chunk.iter().enumerate() {
-                    if i > 0 {
-                        hasher.update(b" ");
-                    }
-                    hasher.update(word.as_bytes());
-                }
-                hasher.digest()
-            })
-            .collect()
+        if count > 0 {
+            hashes.push(hasher.digest());
+        }
+
+        hashes
     }
 
     /// Combines multiple role-based messages into a canonical prompt prefix and chunks it.
@@ -193,5 +226,25 @@ mod tests {
         let blocks = chunker.chunk_text(&massive_text);
         // With max 8 tokens and block_size 4, should produce at most 2 blocks!
         assert_eq!(blocks.len(), 2);
+    }
+
+    #[test]
+    fn test_utf8_multibyte_cutoff_safety() {
+        // 4-byte emojis crossing char_cutoff (8 * 6 = 48 bytes) must never panic
+        let chunker = BlockChunker::new(4).with_max_prefix_tokens(8);
+        let emoji_prompt = "🚀".repeat(40); // 160 bytes, no ASCII whitespace
+        let blocks = chunker.chunk_text(&emoji_prompt);
+        assert!(!blocks.is_empty());
+    }
+
+    #[test]
+    fn test_zero_alloc_fast_chunker() {
+        let chunker = BlockChunker::new_fast(2);
+        let blocks = chunker.chunk_text_fast("alpha beta gamma delta epsilon");
+        assert_eq!(blocks.len(), 3); // [alpha beta], [gamma delta], [epsilon]
+        assert_eq!(
+            blocks,
+            chunker.chunk_text_fast("alpha beta gamma delta epsilon")
+        );
     }
 }
