@@ -1,19 +1,64 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Turnkey script to launch 4 real vLLM workers (--enable-prefix-caching),
+# Turnkey script to launch real vLLM workers (--enable-prefix-caching),
 # an NGINX Round-Robin reverse proxy, and RadixGate,
 # then execute the multi-turn TTFT benchmark.
 
+if ! command -v cargo >/dev/null 2>&1 && [ -f "$HOME/.cargo/env" ]; then
+  # shellcheck disable=SC1091
+  source "$HOME/.cargo/env"
+fi
+
+# Auto-detect GPU topology if NUM_WORKERS / GPU_MEM_UTIL are not explicitly set
+GPU_COUNT=$(nvidia-smi -L 2>/dev/null | wc -l || echo 1)
+VRAM_MIB=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -n 1 || echo 32000)
+
+if [ -z "${NUM_WORKERS:-}" ]; then
+  if [ "$GPU_COUNT" -ge 4 ]; then
+    NUM_WORKERS=4
+    MULTI_GPU="${MULTI_GPU:-1}"
+    GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.80}"
+  elif [ "$VRAM_MIB" -ge 45000 ]; then
+    NUM_WORKERS=4
+    MULTI_GPU="${MULTI_GPU:-0}"
+    GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.22}"
+  else
+    NUM_WORKERS=2
+    MULTI_GPU="${MULTI_GPU:-0}"
+    GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.45}"
+  fi
+fi
+
 MODEL="${MODEL:-Qwen/Qwen2.5-1.5B-Instruct}"
-NUM_WORKERS="${NUM_WORKERS:-4}"
-GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.23}" # 0.23 * 4 = 0.92 on a 24GB-32GB GPU; set 0.85 if using 1 GPU per worker
+GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.45}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-4096}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-16}"
-MULTI_GPU="${MULTI_GPU:-0}"          # Set to 1 if you have >= NUM_WORKERS physical GPUs
-BASE_PORT="${BASE_PORT:-8100}"       # Workers bind BASE_PORT+1 .. BASE_PORT+NUM_WORKERS (avoids :8000/:8001 conflicts)
+MULTI_GPU="${MULTI_GPU:-0}"
+BASE_PORT="${BASE_PORT:-8100}"       # Workers bind BASE_PORT+1 .. BASE_PORT+NUM_WORKERS
 RADIX_PORT="${RADIX_PORT:-8085}"
 NGINX_PORT="${NGINX_PORT:-8095}"
+
+echo "[0/5] Detected ${GPU_COUNT} GPU(s) (${VRAM_MIB} MiB VRAM). Using NUM_WORKERS=${NUM_WORKERS}, GPU_MEM_UTIL=${GPU_MEM_UTIL}, MULTI_GPU=${MULTI_GPU}."
+
+# Guard against broken torchaudio ABI in container images when serving text models
+if ! python3 -c "import transformers.audio_utils" >/dev/null 2>&1; then
+  echo "[preflight] Removing incompatible torchaudio installation for text-only serving..."
+  pip uninstall -y torchaudio >/dev/null 2>&1 || true
+fi
+
+# Guard against vllm-0.34 + torch-2.14 minimax_m3_msa_warmup inductor crash
+python3 - <<'PY' || true
+import importlib.util
+spec = importlib.util.find_spec("vllm.model_executor.warmup.kernel_warmup")
+if spec and spec.origin:
+    s = open(spec.origin, "r", encoding="utf-8").read()
+    target = "from vllm.model_executor.warmup.minimax_m3_msa_warmup import (\n            minimax_m3_msa_warmup,\n        )"
+    if target in s:
+        s = s.replace(target, "pass").replace("minimax_m3_msa_warmup(worker)", "pass")
+        open(spec.origin, "w", encoding="utf-8").write(s)
+        print("[preflight] Patched vllm kernel_warmup.py to skip unused minimax_m3_msa_warmup")
+PY
 
 PIDS=()
 cleanup() {
