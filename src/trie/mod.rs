@@ -267,34 +267,44 @@ impl RadixTree {
         result
     }
 
-    /// Evicts specific blocks for a worker (handling dynamic upstream eviction feedback).
+    /// Evicts specific blocks for a worker in a single O(N) pass and prunes empty branches inline.
     pub fn evict_blocks(&mut self, worker_id: &str, blocks: &[BlockHash]) {
-        for &b in blocks {
-            Self::evict_single_block_recursive(&mut self.root, worker_id, b);
+        if blocks.is_empty() {
+            return;
         }
-        self.prune_empty_nodes();
+        let target_set: HashSet<BlockHash> = blocks.iter().copied().collect();
+        Self::evict_blocks_single_pass(&mut self.root, worker_id, &target_set);
     }
 
-    fn evict_single_block_recursive(node: &mut RadixNode, worker_id: &str, target: BlockHash) {
-        if node.prefix.contains(&target) {
+    fn evict_blocks_single_pass(
+        node: &mut RadixNode,
+        worker_id: &str,
+        targets: &HashSet<BlockHash>,
+    ) -> bool {
+        if node.prefix.iter().any(|b| targets.contains(b)) {
             node.cached_workers.retain(|w| &**w != worker_id);
         }
-        for child in node.children.values_mut() {
-            Self::evict_single_block_recursive(child, worker_id, target);
-        }
+        node.children
+            .retain(|_, child| Self::evict_blocks_single_pass(child, worker_id, targets));
+        !node.children.is_empty()
+            || !node.cached_workers.is_empty()
+            || !node.in_flight_workers.is_empty()
     }
 
-    /// Evicts a worker's registration across the entire tree (e.g. upon worker crash or reboot).
+    /// Evicts a worker's registration across the entire tree in a single pass and prunes empty nodes
+    /// (e.g. upon worker crash, circuit-breaker trip, or Kubernetes pod scale-down).
     pub fn evict_worker(&mut self, worker_id: &str) {
-        Self::evict_worker_recursive(&mut self.root, worker_id);
+        Self::evict_worker_and_prune(&mut self.root, worker_id);
     }
 
-    fn evict_worker_recursive(node: &mut RadixNode, worker_id: &str) {
+    fn evict_worker_and_prune(node: &mut RadixNode, worker_id: &str) -> bool {
         node.cached_workers.retain(|w| &**w != worker_id);
         node.in_flight_workers.retain(|w, _| &**w != worker_id);
-        for child in node.children.values_mut() {
-            Self::evict_worker_recursive(child, worker_id);
-        }
+        node.children
+            .retain(|_, child| Self::evict_worker_and_prune(child, worker_id));
+        !node.children.is_empty()
+            || !node.cached_workers.is_empty()
+            || !node.in_flight_workers.is_empty()
     }
 
     /// Prunes tree branches that have zero active cached workers and zero in-flight leases.
@@ -428,8 +438,25 @@ mod tests {
         trie.insert(&prefix, "worker-1");
 
         // Worker evicts block 502 dynamically
-        trie.evict_blocks("worker-1", &[502]);
+        trie.evict_blocks("worker-1", &[502, 503]);
         let match_res = trie.find_longest_prefix(&prefix);
         assert_eq!(match_res.worker_matches.get("worker-1"), None);
+        assert_eq!(trie.stats().0, 1); // Only root node remains
+    }
+
+    #[test]
+    fn test_evict_worker_prunes_zombie_nodes() {
+        let mut trie = RadixTree::new(64);
+        trie.insert(&[10, 20, 30], "worker-ephemeral");
+        trie.reserve_in_flight(&[40, 50], "worker-ephemeral");
+        assert!(trie.stats().0 > 1);
+
+        trie.evict_worker("worker-ephemeral");
+        let (nodes, active_workers) = trie.stats();
+        assert_eq!(
+            nodes, 1,
+            "Zombie nodes must be pruned after worker eviction"
+        );
+        assert_eq!(active_workers, 0);
     }
 }
