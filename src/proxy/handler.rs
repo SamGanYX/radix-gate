@@ -139,14 +139,16 @@ impl AppState {
             }
         }
 
-        // Prune removed workers
-        let current_ids = self.worker_pool.get_worker_ids();
-        for id in current_ids {
-            if !active_ids.is_empty() && !active_ids.contains(&id) {
-                if let Some(w_arc) = self.worker_pool.get_worker(&id) {
-                    w_arc.write().is_healthy = false;
+        // Prune removed static workers (skip when K8s/DNS discovery manages dynamic pod replicas)
+        if !new_cfg.discovery.enabled && !active_ids.is_empty() {
+            let current_ids = self.worker_pool.get_worker_ids();
+            for id in current_ids {
+                if !active_ids.contains(&id) {
+                    if let Some(w_arc) = self.worker_pool.get_worker(&id) {
+                        w_arc.write().is_healthy = false;
+                    }
+                    self.radix_tree.write().evict_worker(&id);
                 }
-                self.radix_tree.write().evict_worker(&id);
             }
         }
 
@@ -398,6 +400,56 @@ pub async fn handle_anthropic_messages(
     handle_routing(state, headers, payload, raw_body, true).await
 }
 
+/// RAII guard protecting worker `active_requests` and Radix Tree `in_flight` leases
+/// against async task cancellation (e.g., client disconnect during upstream prefill).
+struct PrefillLeaseGuard<'a> {
+    worker: Arc<RwLock<crate::shadow_cache::WorkerReplica>>,
+    worker_id: String,
+    radix_tree: &'a Arc<RwLock<RadixTree>>,
+    block_hashes: &'a [BlockHash],
+    armed: bool,
+}
+
+impl<'a> PrefillLeaseGuard<'a> {
+    fn acquire(
+        worker: Arc<RwLock<crate::shadow_cache::WorkerReplica>>,
+        worker_id: String,
+        radix_tree: &'a Arc<RwLock<RadixTree>>,
+        block_hashes: &'a [BlockHash],
+    ) -> Self {
+        worker.read().active_requests.fetch_add(1, Ordering::SeqCst);
+        radix_tree
+            .write()
+            .reserve_in_flight(block_hashes, &worker_id);
+        Self {
+            worker,
+            worker_id,
+            radix_tree,
+            block_hashes,
+            armed: true,
+        }
+    }
+
+    fn disarm(mut self) -> (Arc<RwLock<crate::shadow_cache::WorkerReplica>>, String) {
+        self.armed = false;
+        (self.worker.clone(), self.worker_id.clone())
+    }
+}
+
+impl Drop for PrefillLeaseGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.radix_tree
+                .write()
+                .release_in_flight(self.block_hashes, &self.worker_id, false);
+            self.worker
+                .read()
+                .active_requests
+                .fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+}
+
 async fn handle_routing(
     state: Arc<AppState>,
     headers: HeaderMap,
@@ -492,9 +544,9 @@ async fn handle_routing(
         .total_prompt_blocks
         .fetch_add(total_blocks as u64, Ordering::Relaxed);
 
-    // 3. Acquire optimistic in-flight prefill lease on selected worker
-    let mut current_worker_id = decision.worker_id.clone();
-    let mut current_worker_arc = match state.worker_pool.get_worker(&current_worker_id) {
+    // 3. Acquire optimistic in-flight prefill lease on selected worker (RAII-guarded against cancellation)
+    let current_worker_id = decision.worker_id.clone();
+    let current_worker_arc = match state.worker_pool.get_worker(&current_worker_id) {
         Some(w) => w,
         None => {
             return (
@@ -505,16 +557,12 @@ async fn handle_routing(
         }
     };
 
-    current_worker_arc
-        .read()
-        .active_requests
-        .fetch_add(1, Ordering::SeqCst);
-
-    // Optimistically reserve prefix in trie to prevent concurrent thundering-herd cold prefills
-    {
-        let mut tree = state.radix_tree.write();
-        tree.reserve_in_flight(&block_hashes, &current_worker_id);
-    }
+    let mut active_guard: Option<PrefillLeaseGuard<'_>> = Some(PrefillLeaseGuard::acquire(
+        current_worker_arc,
+        current_worker_id.clone(),
+        &state.radix_tree,
+        &block_hashes,
+    ));
 
     let endpoint_url = decision.endpoint_url.clone();
     let is_real_upstream =
@@ -536,7 +584,9 @@ async fn handle_routing(
         .await
         {
             Ok(resp) => {
-                current_worker_arc.write().record_success();
+                if let Some(ref g) = active_guard {
+                    g.worker.write().record_success();
+                }
                 final_response = Some(resp);
             }
             Err(err) => {
@@ -545,22 +595,20 @@ async fn handle_routing(
                     error = %err,
                     "Primary upstream worker failed; checking circuit breaker and initiating failover"
                 );
-                let tripped = current_worker_arc.write().record_failure();
-                {
-                    let mut tree = state.radix_tree.write();
-                    tree.release_in_flight(&block_hashes, &current_worker_id, false);
+                let failed_worker = active_guard.as_ref().map(|g| g.worker.clone());
+                // Drop guard first: releases trie in-flight lease and decrements active_requests
+                drop(active_guard.take());
+
+                if let Some(w_arc) = failed_worker {
+                    let tripped = w_arc.write().record_failure();
                     if tripped {
                         warn!(
                             worker = %current_worker_id,
                             "Circuit breaker TRIPPED! Evicting worker from Radix Tree"
                         );
-                        tree.evict_worker(&current_worker_id);
+                        state.radix_tree.write().evict_worker(&current_worker_id);
                     }
                 }
-                current_worker_arc
-                    .read()
-                    .active_requests
-                    .fetch_sub(1, Ordering::SeqCst);
 
                 // Failover Retry Loop: Attempt other healthy workers in cluster
                 let candidates = state.worker_pool.get_healthy_worker_ids();
@@ -570,14 +618,12 @@ async fn handle_routing(
                     }
                     if let Some(candidate_arc) = state.worker_pool.get_worker(&candidate_id) {
                         let candidate_url = candidate_arc.read().endpoint_url.clone();
-                        candidate_arc
-                            .read()
-                            .active_requests
-                            .fetch_add(1, Ordering::SeqCst);
-                        state
-                            .radix_tree
-                            .write()
-                            .reserve_in_flight(&block_hashes, &candidate_id);
+                        let cand_guard = PrefillLeaseGuard::acquire(
+                            candidate_arc.clone(),
+                            candidate_id.clone(),
+                            &state.radix_tree,
+                            &block_hashes,
+                        );
 
                         info!(from = %current_worker_id, to = %candidate_id, "Retrying request on failover worker");
 
@@ -594,25 +640,17 @@ async fn handle_routing(
                         {
                             Ok(resp) => {
                                 candidate_arc.write().record_success();
-                                current_worker_id = candidate_id.clone();
-                                current_worker_arc = candidate_arc;
+                                active_guard = Some(cand_guard);
                                 final_response = Some(resp);
                                 break;
                             }
                             Err(retry_err) => {
                                 warn!(candidate = %candidate_id, error = %retry_err, "Failover candidate failed");
+                                drop(cand_guard);
                                 let tripped = candidate_arc.write().record_failure();
-                                {
-                                    let mut tree = state.radix_tree.write();
-                                    tree.release_in_flight(&block_hashes, &candidate_id, false);
-                                    if tripped {
-                                        tree.evict_worker(&candidate_id);
-                                    }
+                                if tripped {
+                                    state.radix_tree.write().evict_worker(&candidate_id);
                                 }
-                                candidate_arc
-                                    .read()
-                                    .active_requests
-                                    .fetch_sub(1, Ordering::SeqCst);
                             }
                         }
                     }
@@ -633,6 +671,7 @@ async fn handle_routing(
     let mut response = match final_response {
         Some(resp) => resp,
         None => {
+            drop(active_guard);
             return (
                 StatusCode::BAD_GATEWAY,
                 Json(json!({
@@ -646,6 +685,12 @@ async fn handle_routing(
                 .into_response();
         }
     };
+
+    // Disarm PrefillLeaseGuard and transfer ownership of active_requests to InFlightGuard
+    let (current_worker_arc, current_worker_id) = active_guard
+        .take()
+        .expect("active_guard must be armed when final_response is Some")
+        .disarm();
 
     let hit_ratio = if total_blocks > 0 {
         decision.matched_blocks as f64 / total_blocks as f64
@@ -1394,5 +1439,83 @@ workers:
         // Verify upstream received child span with the exact same trace ID
         let upstream_traceparent = rx.recv().await.unwrap();
         assert!(upstream_traceparent.starts_with("00-4bf92f3577b34da6a3ce929d0e0e4736-"));
+    }
+
+    #[tokio::test]
+    async fn test_async_cancellation_releases_inflight_and_trie_lease() {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+        let started_tx = Arc::new(parking_lot::Mutex::new(Some(started_tx)));
+
+        // Slow upstream that stalls during prefill
+        let upstream_app = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(move || {
+                let tx = started_tx.lock().take();
+                async move {
+                    if let Some(tx) = tx {
+                        let _ = tx.send(());
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    (StatusCode::OK, Json(json!({"choices": []})))
+                }
+            }),
+        );
+        let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_port = upstream_listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(upstream_listener, upstream_app).await.unwrap();
+        });
+
+        let tree = Arc::new(RwLock::new(RadixTree::new(4)));
+        let pool = Arc::new(WorkerPool::new());
+        pool.add_worker(WorkerReplica::new(
+            "worker-slow".into(),
+            format!("http://127.0.0.1:{}", upstream_port),
+            1000,
+            16,
+        ));
+        let chunker = BlockChunker::new(4);
+        let state = Arc::new(AppState::new(tree.clone(), pool.clone(), chunker));
+        let router = create_router(state.clone());
+
+        let prompt = "Cancel this long prefill request cleanly without leaking leases.";
+        let body = json!({
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": prompt}]
+        });
+        let http_req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+
+        use tower::ServiceExt;
+        // Wait until upstream actually receives the request (so handle_routing is mid-await),
+        // then drop the oneshot future (simulating HTTP/2 RST_STREAM or TimeoutLayer cancellation).
+        tokio::select! {
+            _ = router.oneshot(http_req) => panic!("Expected slow upstream not to finish immediately"),
+            _ = started_rx => {}
+        }
+
+        let active = pool
+            .get_worker("worker-slow")
+            .unwrap()
+            .read()
+            .active_requests
+            .load(Ordering::SeqCst);
+        assert_eq!(
+            active, 0,
+            "active_requests leaked after handler cancellation!"
+        );
+
+        let blocks = state.chunker.chunk_text(
+            "<|user|>\nCancel this long prefill request cleanly without leaking leases.\n<|end|>\n",
+        );
+        let match_res = tree.read().find_longest_prefix(&blocks);
+        assert!(
+            match_res.in_flight_matches.is_empty(),
+            "in-flight trie lease leaked after handler cancellation!"
+        );
     }
 }
