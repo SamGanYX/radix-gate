@@ -2,7 +2,7 @@ pub mod node;
 pub mod sharded;
 
 pub use node::{BlockHash, RadixNode, WorkerId};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -14,12 +14,55 @@ pub struct RadixTree {
     pub block_size_tokens: usize,
 }
 
+/// Compact, allocation-light map from `WorkerId` to longest matched prefix depth in blocks.
+/// Eliminates `HashMap` bucket allocations and SipHash overhead on every trie lookup.
+#[derive(Debug, Clone, Default)]
+pub struct WorkerMatchMap {
+    entries: Vec<(WorkerId, usize)>,
+}
+
+impl WorkerMatchMap {
+    #[inline]
+    pub fn get(&self, worker_id: &str) -> Option<&usize> {
+        self.entries
+            .iter()
+            .find(|(w, _)| &**w == worker_id)
+            .map(|(_, v)| v)
+    }
+
+    #[inline]
+    pub fn contains_key(&self, worker_id: &str) -> bool {
+        self.entries.iter().any(|(w, _)| &**w == worker_id)
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    #[inline]
+    pub fn iter(&self) -> impl Iterator<Item = (&WorkerId, &usize)> {
+        self.entries.iter().map(|(k, v)| (k, v))
+    }
+
+    #[inline]
+    pub fn record_max(&mut self, worker: &WorkerId, depth: usize) {
+        if let Some((_, existing)) = self.entries.iter_mut().find(|(w, _)| **w == **worker) {
+            if depth > *existing {
+                *existing = depth;
+            }
+        } else {
+            self.entries.push((Arc::clone(worker), depth));
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct MatchResult {
     /// Number of matching blocks confirmed in cache for each worker.
-    pub worker_matches: HashMap<WorkerId, usize>,
+    pub worker_matches: WorkerMatchMap,
     /// Number of matching blocks currently being prefilled in-flight by a worker.
-    pub in_flight_matches: HashMap<WorkerId, usize>,
+    pub in_flight_matches: WorkerMatchMap,
     /// Longest match length across all workers in blocks.
     pub max_matched_blocks: usize,
     /// Indicates whether any matched branch has high cumulative access velocity / is a hotspot.
@@ -231,10 +274,7 @@ impl RadixTree {
 
                 // Track confirmed cached workers
                 for worker in &child.cached_workers {
-                    let entry = result.worker_matches.entry(Arc::clone(worker)).or_insert(0);
-                    if matched_depth > *entry {
-                        *entry = matched_depth;
-                    }
+                    result.worker_matches.record_max(worker, matched_depth);
                     if matched_depth > result.max_matched_blocks {
                         result.max_matched_blocks = matched_depth;
                     }
@@ -243,13 +283,7 @@ impl RadixTree {
                 // Track in-flight prefilling workers for request coalescing
                 for (worker, &count) in &child.in_flight_workers {
                     if count > 0 {
-                        let entry = result
-                            .in_flight_matches
-                            .entry(Arc::clone(worker))
-                            .or_insert(0);
-                        if matched_depth > *entry {
-                            *entry = matched_depth;
-                        }
+                        result.in_flight_matches.record_max(worker, matched_depth);
                     }
                 }
 
