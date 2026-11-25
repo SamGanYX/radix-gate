@@ -16,19 +16,39 @@ pub struct ChatMessage {
 
 impl ChatMessage {
     pub fn content_as_str(&self) -> String {
+        let mut out = String::new();
+        self.append_content_bounded(&mut out, None);
+        out
+    }
+
+    /// Appends message text directly into `out` without intermediate String allocations.
+    pub fn append_content_bounded(&self, out: &mut String, max_bytes: Option<usize>) {
+        let cap_reached = |buf: &str| max_bytes.is_some_and(|m| buf.len() >= m);
+        if cap_reached(out) {
+            return;
+        }
         if let Some(s) = self.content.as_str() {
-            s.to_string()
+            if let Some(limit) = max_bytes {
+                let remaining = limit.saturating_sub(out.len());
+                if s.len() > remaining {
+                    let safe = s.floor_char_boundary(remaining);
+                    out.push_str(&s[..safe]);
+                    return;
+                }
+            }
+            out.push_str(s);
         } else if let Some(arr) = self.content.as_array() {
-            let mut out = String::new();
             for item in arr {
+                if cap_reached(out) {
+                    break;
+                }
                 if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
                     out.push_str(text);
                     out.push(' ');
                 }
             }
-            out
         } else {
-            self.content.to_string()
+            out.push_str(&self.content.to_string());
         }
     }
 
@@ -79,14 +99,32 @@ pub struct ChatRequest {
 impl ChatRequest {
     /// Extracts canonical text for prompt prefix matching.
     pub fn extract_prompt_text(&self) -> String {
-        let mut full_prompt = String::new();
+        self.extract_prompt_text_bounded(None)
+    }
+
+    /// Extracts canonical text up to an optional `max_bytes` prefix budget, avoiding large
+    /// multi-turn heap allocations when only the prefix window is tokenized.
+    pub fn extract_prompt_text_bounded(&self, max_bytes: Option<usize>) -> String {
+        let initial_cap = max_bytes.map_or(512, |m| m.min(8192));
+        let mut full_prompt = String::with_capacity(initial_cap);
 
         if let Some(sys) = &self.system {
             full_prompt.push_str("<|system|>\n");
             if let Some(s) = sys.as_str() {
+                if let Some(limit) = max_bytes {
+                    let remaining = limit.saturating_sub(full_prompt.len());
+                    if s.len() > remaining {
+                        let safe = s.floor_char_boundary(remaining);
+                        full_prompt.push_str(&s[..safe]);
+                        return full_prompt;
+                    }
+                }
                 full_prompt.push_str(s);
             } else if let Some(arr) = sys.as_array() {
                 for item in arr {
+                    if max_bytes.is_some_and(|m| full_prompt.len() >= m) {
+                        return full_prompt;
+                    }
                     if let Some(t) = item.get("text").and_then(|x| x.as_str()) {
                         full_prompt.push_str(t);
                         full_prompt.push(' ');
@@ -99,8 +137,13 @@ impl ChatRequest {
         }
 
         for msg in &self.messages {
-            full_prompt.push_str(&format!("<|{}|>\n", msg.role));
-            full_prompt.push_str(&msg.content_as_str());
+            if max_bytes.is_some_and(|m| full_prompt.len() >= m) {
+                break;
+            }
+            full_prompt.push_str("<|");
+            full_prompt.push_str(&msg.role);
+            full_prompt.push_str("|>\n");
+            msg.append_content_bounded(&mut full_prompt, max_bytes);
             full_prompt.push_str("\n<|end|>\n");
         }
 
@@ -167,5 +210,23 @@ mod tests {
                 .extract_prompt_text()
                 .contains("Large documentation prefix")
         );
+    }
+
+    #[test]
+    fn test_bounded_prompt_extraction() {
+        let big_turn = "x".repeat(50_000);
+        let request: ChatRequest = serde_json::from_value(json!({
+            "model": "gpt-4o",
+            "messages": [
+                {"role": "system", "content": "Shared system header"},
+                {"role": "user", "content": big_turn},
+                {"role": "assistant", "content": big_turn}
+            ]
+        }))
+        .unwrap();
+
+        let bounded = request.extract_prompt_text_bounded(Some(256));
+        assert!(bounded.len() <= 300);
+        assert!(bounded.contains("Shared system header"));
     }
 }

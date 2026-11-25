@@ -486,8 +486,8 @@ async fn handle_routing(
     );
     let _enter = _span.enter();
 
-    // 1. Extract prompt and compute token block hashes
-    let prompt_text = payload.extract_prompt_text();
+    // 1. Extract bounded prompt prefix and compute token block hashes
+    let prompt_text = payload.extract_prompt_text_bounded(state.chunker.prefix_byte_budget());
     let block_hashes = state.chunker.chunk_text(&prompt_text);
     let total_blocks = block_hashes.len();
 

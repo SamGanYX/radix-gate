@@ -57,6 +57,11 @@ impl BlockChunker {
         self
     }
 
+    /// Returns the byte budget needed from raw prompt text to satisfy `max_prefix_tokens`.
+    pub fn prefix_byte_budget(&self) -> Option<usize> {
+        self.max_prefix_tokens.map(|m| m.saturating_mul(6))
+    }
+
     /// Creates a lightweight chunker without BPE (fast word-slice approximation).
     pub fn new_fast(block_size: usize) -> Self {
         Self {
